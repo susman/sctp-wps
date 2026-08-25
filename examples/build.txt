@@ -1,0 +1,15 @@
+# Build the library first.
+zig build --release=fast -Dtarget=native
+
+# Use these commands when the archive contains the vendored WavPack-stream.
+zig cc -o sender examples/sender.c -Iinclude -Lzig-out/lib -lsctp-wps -lm
+zig cc -o receiver examples/receiver.c -Iinclude -Lzig-out/lib -lsctp-wps -lm
+
+# Add this library when the native Linux build found system WavPack-stream.
+zig cc -o sender examples/sender.c -Iinclude -Lzig-out/lib -lsctp-wps -lwavpack-stream -lm
+zig cc -o receiver examples/receiver.c -Iinclude -Lzig-out/lib -lsctp-wps -lwavpack-stream -lm
+
+# Build and link the universal macOS archive.
+zig build --release=fast -Dmacos-universal
+zig cc -o sender examples/sender.c -Iinclude -Lzig-out/macos-universal/lib -lsctp-wps -lm
+zig cc -o receiver examples/receiver.c -Iinclude -Lzig-out/macos-universal/lib -lsctp-wps -lm

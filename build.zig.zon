@@ -1,0 +1,14 @@
+.{
+    .name = .sctp_wps,
+    .version = "1.0.0",
+    .fingerprint = 0xb021882b0866cb29,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "include",
+        "wavpack-stream",
+        "usrsctp",
+    },
+}

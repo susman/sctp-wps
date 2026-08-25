@@ -1,0 +1,6 @@
+[submodule "usrsctp"]
+	path = usrsctp
+	url = git@github.com:sctplab/usrsctp.git
+[submodule "wavpack-stream"]
+	path = wavpack-stream
+	url = git@github.com:dbry/wavpack-stream.git
