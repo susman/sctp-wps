@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish-zig-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Create package tarball
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          tar --exclude=.git -czf "sctp-wps-${tag}.tar.gz" .
+          for expected in \
+              usrsctp/usrsctplib/netinet/sctp_os_userspace.h \
+              wavpack-stream/src/pack_utils.c
+          do
+              tar -tzf "sctp-wps-${tag}.tar.gz" | sed 's|^./||' | grep -qx "${expected}"
+          done
+
+      - name: Install Zig
+        run: |
+          curl -fsSLo /tmp/zig.tar.xz \
+            https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          mkdir -p /tmp/zig
+          tar -xJf /tmp/zig.tar.xz -C /tmp/zig --strip-components=1
+          echo /tmp/zig >> "${GITHUB_PATH}"
+
+      - name: Validate package
+        run: zig fetch "sctp-wps-${GITHUB_REF_NAME}.tar.gz" > /dev/null
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release create "${tag}" --verify-tag --generate-notes \
+            "sctp-wps-${tag}.tar.gz" \
+          || gh release upload "${tag}" "sctp-wps-${tag}.tar.gz" --clobber

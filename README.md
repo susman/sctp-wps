@@ -40,6 +40,16 @@ zig build test
 
 Network tests need SCTP support. Tests that need a network stack return without running when the platform lacks the required SCTP support.
 
+## Consuming as a Zig package
+
+Downstream projects must pin a release tarball that embeds the submodule trees. A plain `git+https://` URL does not work: Zig's package manager does not initialize git submodules, so the fetched copy would lack the C sources.
+
+```bash
+zig fetch --save https://github.com/susman/sctp-wps/releases/download/vX.Y.Z/sctp-wps-vX.Y.Z.tar.gz
+```
+
+Release assets are built with `./package.sh vX.Y.Z` or automatically by the release workflow on tag push.
+
 ## C API
 
 Include `sctp-wps.h` and link with `libsctp-wps.a`. The API exposes opaque writer and reader handles. Functions return zero on success and `-1` on failure unless documented otherwise.

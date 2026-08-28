@@ -72,3 +72,8 @@ Both backends expose matching `SctpSender` and `SctpReceiver` APIs. UDP encapsul
 ## Zig API
 
 `src/root.zig` exports `Writer`, `Reader`, `StreamConfig`, `SwpsStreamConfig`, `WpConfig`, `SctpConfig`, and `SctpRecvConfig`. It also exports the `wpstream` and `sctp` modules.
+
+## Packaging
+
+- Release tarballs (`sctp-wps-v<ver>.tar.gz`) embed the submodule trees. Build one with `./package.sh v<ver>` or let `.github/workflows/release.yml` publish it on tag push.
+- Consumers must pin the release asset URL in their `build.zig.zon`. A plain `git+https://` URL yields empty `usrsctp/` and `wavpack-stream/` directories because Zig does not fetch git submodules.

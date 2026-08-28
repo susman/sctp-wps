@@ -1,5 +1,7 @@
 .zig-cache
+zig-out
+zig-pkg
 receiver
 sender
-zig-out
 *.swp
+*.tar.gz
