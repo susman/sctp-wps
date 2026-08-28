@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout with submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -22,12 +22,23 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           archive="${RUNNER_TEMP}/sctp-wps-${tag}.tar.gz"
-          tar --exclude=.git -czf "${archive}" -C "${GITHUB_WORKSPACE}" .
+          tar --exclude=.git \
+            --exclude=.github \
+            --exclude=.gitignore \
+            --exclude=.gitmodules \
+            --exclude=examples \
+            --exclude=AGENTS.md \
+            --exclude=package.sh \
+            -czf "${archive}" -C "${GITHUB_WORKSPACE}" .
+          files="$(tar -tzf "${archive}" | sed 's|^./||')"
           for expected in \
               usrsctp/usrsctplib/netinet/sctp_os_userspace.h \
               wavpack-stream/src/pack_utils.c
           do
-              tar -tzf "${archive}" | sed 's|^./||' | grep -qx "${expected}"
+              printf '%s\n' "$files" | grep -qx "${expected}" || {
+                  echo "error: ${archive} is missing ${expected}" >&2
+                  exit 1
+              }
           done
           echo "path=${archive}" >> "$GITHUB_OUTPUT"
 

@@ -28,11 +28,12 @@ GIT_TERMINAL_PROMPT=0 git \
 tar --exclude=.git -czf "${name}" -C "${work}/src" .
 
 # The package must contain the C sources of both submodules.
+files="$(tar -tzf "${name}" | sed 's|^./||')"
 for expected in \
     usrsctp/usrsctplib/netinet/sctp_os_userspace.h \
     wavpack-stream/src/pack_utils.c
 do
-    if ! tar -tzf "${name}" | sed 's|^./||' | grep -qx "${expected}"; then
+    if ! printf '%s\n' "$files" | grep -qx "${expected}"; then
         echo "error: ${name} is missing ${expected}" >&2
         exit 1
     fi
