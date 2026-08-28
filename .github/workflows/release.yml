@@ -18,15 +18,18 @@ jobs:
           submodules: recursive
 
       - name: Create package tarball
+        id: tarball
         run: |
           tag="${GITHUB_REF_NAME}"
-          tar --exclude=.git -czf "sctp-wps-${tag}.tar.gz" .
+          archive="${RUNNER_TEMP}/sctp-wps-${tag}.tar.gz"
+          tar --exclude=.git -czf "${archive}" -C "${GITHUB_WORKSPACE}" .
           for expected in \
               usrsctp/usrsctplib/netinet/sctp_os_userspace.h \
               wavpack-stream/src/pack_utils.c
           do
-              tar -tzf "sctp-wps-${tag}.tar.gz" | sed 's|^./||' | grep -qx "${expected}"
+              tar -tzf "${archive}" | sed 's|^./||' | grep -qx "${expected}"
           done
+          echo "path=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Install Zig
         run: |
@@ -37,7 +40,7 @@ jobs:
           echo /tmp/zig >> "${GITHUB_PATH}"
 
       - name: Validate package
-        run: zig fetch "sctp-wps-${GITHUB_REF_NAME}.tar.gz" > /dev/null
+        run: zig fetch "${{ steps.tarball.outputs.path }}" > /dev/null
 
       - name: Publish release asset
         env:
@@ -45,5 +48,5 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           gh release create "${tag}" --verify-tag --generate-notes \
-            "sctp-wps-${tag}.tar.gz" \
-          || gh release upload "${tag}" "sctp-wps-${tag}.tar.gz" --clobber
+            "${{ steps.tarball.outputs.path }}" \
+          || gh release upload "${tag}" "${{ steps.tarball.outputs.path }}" --clobber
