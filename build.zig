@@ -253,7 +253,8 @@ fn haveSystemWavpackStream(b: *std.Build) bool {
 /// Expose the module as "usrsctp_c" for non-Linux targets.
 ///
 /// SDK requirements for a macOS target:
-///     - A macOS host uses the SDK detected by Zig.
+///     - A macOS host resolves the SDK with xcrun and adds its headers and
+///       frameworks explicitly, for native and cross targets alike.
 ///     - A Linux host needs ../macos/MacOSX.sdk.
 fn addUsrsctp(
     b: *std.Build,
@@ -293,20 +294,22 @@ fn addUsrsctp(
     };
 
     if (target.result.os.tag == .macos) {
-        if (host_os == .macos) {
+        const sdk = if (host_os == .macos) blk: {
+            // Avoid xcrun popping the Command Line Tools installer.
             if (!std.zig.system.darwin.isSdkInstalled(b.allocator, b.graph.io)) {
                 @panic("macOS SDK is not installed. Install Xcode or Command Line Tools");
             }
-        } else {
-            const sdk = localSDKRoot(b) orelse
-                @panic("macOS SDK at ../macos/MacOSX.sdk is expected");
-            mod.addSystemIncludePath(.{
-                .cwd_relative = b.pathJoin(&.{ sdk, "usr", "include" }),
-            });
-            mod.addSystemFrameworkPath(.{
-                .cwd_relative = b.pathJoin(&.{ sdk, "System", "Library", "Frameworks" }),
-            });
-        }
+            break :blk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
+                @panic("macOS SDK is not installed. Install Xcode or Command Line Tools");
+        } else (localSDKRoot(b) orelse
+            @panic("macOS SDK at ../macos/MacOSX.sdk is expected"));
+
+        mod.addSystemIncludePath(.{
+            .cwd_relative = b.pathJoin(&.{ sdk, "usr", "include" }),
+        });
+        mod.addSystemFrameworkPath(.{
+            .cwd_relative = b.pathJoin(&.{ sdk, "System", "Library", "Frameworks" }),
+        });
     }
 
     const subdirs = [_][]const u8{ ".", "netinet", "netinet6" };
