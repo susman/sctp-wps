@@ -1,17 +1,25 @@
 # sctp-wps development notes
 
-## Build Commands
+## After changes
+
+Run all four before finishing:
+
+- `zig build test`
+- `zig build`
+- `zig fmt --check src build.zig`
+- `zlint .`
+
+Expected lint result is 0 errors and 0 warnings.
+
+## Build notes
 
 ```bash
 # First-time only: initialize submodules
 git submodule update --init --recursive
 
-# Build the library and install the header
+# Release build
 zig build --release=fast -Dtarget=native
 # Output: zig-out/lib/libsctp-wps.a, zig-out/include/sctp-wps.h
-
-# Run unit and network tests
-zig build test
 ```
 
 ## Architecture
@@ -20,6 +28,7 @@ zig build test
 - **C bindings**: TranslateC imports the WavPack-stream and usrsctp headers.
 - **Purpose**: Encode PCM with WavPack-stream and transport it over SCTP.
 - **Submodules**: `wavpack-stream/` and `usrsctp/`.
+- **Protocol constants**: `src/protocol.zig` owns the wire block size bound and WavPack block alignment.
 - **Linux dependency**: The native build can use system WavPack-stream or the submodule.
 - **Non-Linux dependency**: The build compiles WavPack-stream and usrsctp from the submodules.
 
@@ -48,6 +57,7 @@ Both backends expose matching `SctpSender` and `SctpReceiver` APIs. UDP encapsul
 ## Testing
 
 - Network tests require SCTP support. They return without running when support is unavailable.
+- Integration tests live in `src/tests.zig`, referenced from the root test block.
 - Cross-process tests use `src/peer.zig`, built as `sctp-wps-peer`.
 - The peer executable path is injected as `build_options.peer_path` at compile time.
 - Peer tests include `"SctpSender/SctpReceiver loopback with peer"`, `"Writer -> Reader lossless round-trip with peer (cross-platform)"`, `"mono audio round-trip with peer"`, and `"peer buffering pre-fill"`.
@@ -56,6 +66,8 @@ Both backends expose matching `SctpSender` and `SctpReceiver` APIs. UDP encapsul
 ## Key Constraints
 
 - WavPack-stream `terminate-block-at-byte-size` supports S16/S24 PCM with 1 or 2 channels.
+- The writer PCM ring is fixed at 8 slots of 16384 i32 values.
+- The reader block queue is the only runtime-sized audio buffer. Its elements and the 8-slot decoded PCM pool are fixed.
 - Block sizing uses an effective 1500-byte MTU cap on loopback. This keeps tests close to the target network profile.
 - `Writer` and `Reader` must stay at stable addresses while initialized or running.
 - WavPack stores an internal pointer to the `Encoder` inside `Writer`.
@@ -65,13 +77,13 @@ Both backends expose matching `SctpSender` and `SctpReceiver` APIs. UDP encapsul
 
 `include/sctp-wps.h`:
 - Config: `swps_wp_config_default`, `swps_sctp_config_default`, `swps_sctp_recv_config_default`.
-- Writer: `swps_writer_create`, `swps_writer_init`, `swps_writer_write`, `swps_writer_flush`, `swps_writer_check`, `swps_writer_deinit`, `swps_writer_destroy`, `swps_writer_cancel_connect`.
+- Writer: `swps_writer_create`, `swps_writer_init`, `swps_writer_write`, `swps_writer_try_write`, `swps_writer_flush`, `swps_writer_check`, `swps_writer_deinit`, `swps_writer_destroy`, `swps_writer_cancel_connect`.
 - Reader: `swps_reader_create`, `swps_reader_init`, `swps_reader_accept`, `swps_reader_recv_config`, `swps_reader_start`, `swps_reader_read_frame`, `swps_reader_poll_new_sender`, `swps_reader_next_session`, `swps_reader_cancel`, `swps_reader_destroy`.
 - Stack: `swps_stack_acquire` and `swps_stack_release`. They manage the usrsctp reference count. They are no-ops on Linux.
 
 ## Zig API
 
-`src/root.zig` exports `Writer`, `Reader`, `StreamConfig`, `SwpsStreamConfig`, `WpConfig`, `SctpConfig`, and `SctpRecvConfig`. It also exports the `wpstream` and `sctp` modules.
+`src/root.zig` exports `Writer`, `Reader`, `StreamConfig`, `SwpsStreamConfig`, `WpConfig`, `SctpConfig`, and `SctpRecvConfig`. It also exports the `wpstream`, `sctp`, and `protocol` modules. Caller code must supply `std.Io` and `std.mem.Allocator` and call `initUninitialized()` before the first `init()`. The C ABI is the only layer that creates an Io and an allocator.
 
 ## Packaging
 

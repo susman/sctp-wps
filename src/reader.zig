@@ -23,30 +23,50 @@
 const std = @import("std");
 const wpstream = @import("wpstream.zig");
 const sctp = @import("sctp.zig");
+const protocol = @import("protocol.zig");
 const BoundedQueue = @import("queue.zig").BoundedQueue;
+const BgErr = @import("queue.zig").BgErr;
 const ctrl = @import("control_channel.zig");
 const SocketAddr = sctp.SocketAddr;
-const alloc = std.heap.c_allocator;
 
 /// A received WavPack-stream block for decoding.
+/// The payload is copied into fixed storage owned by the queue.
 const WpBlock = struct {
-    data: []u8, // Heap-allocated. Freed after decoding.
+    data: [max_recv_buf]u8,
+    len: usize,
+
+    fn slice(self: *const WpBlock) []const u8 {
+        return self.data[0..self.len];
+    }
 };
 
-/// A decoded PCM frame produced by the decode thread.
-const PcmFrame = struct {
-    samples: []i32, // Heap-allocated. Freed after copying to the caller.
+/// Copy one validated block into fixed storage.
+fn newWpBlock(data: []const u8) WpBlock {
+    // SAFETY: the copy initializes every byte read through `len`.
+    var block: WpBlock = undefined;
+    @memcpy(block.data[0..data.len], data);
+    block.len = data.len;
+    return block;
+}
+
+/// One decoded frame slot reference. The samples live in `Reader.pcm_pool`.
+const PcmRef = struct {
+    slot: u8,
+    len: usize,
 };
 
-/// Capacity of the decoded PCM queue. It is fixed at eight blocks.
-const pcm_out_queue_depth = 8;
-/// Prevent an unbounded caller-provided allocation.
+/// Capacity of the decoded PCM pool and its queue. Fixed at eight blocks.
+const pcm_pool_slots = 8;
+/// Prevent an unbounded caller-provided block queue.
+///
+/// Memory cost scales with this value. Each queued WavPack block occupies
+/// about 2 KiB, so a depth of 65536 allocates roughly 128 MiB for the
+/// block queue alone. Choose the depth from the expected network jitter.
 const max_buffer_depth = 1 << 16;
 
 /// Size of the stack-allocated SCTP receive buffer.
-/// The current block-sizing policy caps payloads at 1452 bytes. This cap
-/// applies to WavPack block sizing. It does not limit unrelated SCTP traffic.
-const max_recv_buf = 2 * 1024;
+/// The writer caps each WavPack block below this bound.
+const max_recv_buf: usize = protocol.max_wire_block_bytes;
 /// Bound audio blocks received before the control message arrives.
 const max_startup_blocks = 8;
 
@@ -62,18 +82,21 @@ pub const StreamConfig = struct {
 
 /// A threaded WavPack-stream reader with SCTP transport.
 pub const Reader = struct {
-    pub const Lifecycle = enum { uninitialized, initializing, initialized, running };
+    pub const Lifecycle = enum(u8) { uninitialized, initializing, initialized, running };
 
     /// Resource state used to make failed initialization and destruction safe.
-    lifecycle: Lifecycle = .uninitialized,
+    lifecycle: std.atomic.Value(Lifecycle) = .init(.uninitialized),
     /// SCTP receiver transport.
     transport: sctp.SctpReceiver,
     /// Encoded blocks from the receive thread to the decode thread.
     /// `start()` sets its capacity. It acts as a jitter buffer.
     block_queue: BoundedQueue(WpBlock),
-    /// Decoded PCM blocks from the decode thread to the caller.
-    /// Its capacity is fixed by `pcm_out_queue_depth`.
-    pcm_out_queue: BoundedQueue(PcmFrame),
+    /// Decoded frame references from the decode thread to the caller.
+    pcm_out_queue: BoundedQueue(PcmRef),
+    /// Free decoded frame slots. Initialized with 0..pcm_pool_slots - 1.
+    free_slots: BoundedQueue(u8),
+    /// Fixed decoded sample storage. Each slot is one WavPack block frame.
+    pcm_pool: [pcm_pool_slots][protocol.max_decoded_samples]i32,
     /// Background thread that receives encoded blocks.
     recv_thread: std.Thread,
     /// Background thread that decodes blocks.
@@ -83,22 +106,60 @@ pub const Reader = struct {
     /// True after `start()` spawns the decode thread.
     decode_thread_started: bool = false,
     /// First fatal error reported by a background thread.
-    bg_err: ?anyerror,
-    bg_err_mutex: std.Io.Mutex = .init,
+    bg_err: BgErr = .{},
     /// Receiver configuration retained for takeover operations.
     sctp_cfg: sctp.SctpReceiver.Config,
     /// Io context backing the reader's mutexes and queues.
     io: std.Io = std.Io.failing,
+    /// Allocator for queues. Set by init().
+    allocator: std.mem.Allocator,
     transport_initialized: bool = false,
     block_queue_initialized: bool = false,
     pcm_queue_initialized: bool = false,
+    free_queue_initialized: bool = false,
     session_active: bool = false,
     config_received: bool = false,
     stream_config: ?StreamConfig = null,
     /// Blocks received before the control message is delivered.
-    startup_blocks: std.ArrayListUnmanaged(WpBlock) = .empty,
+    startup_blocks: [max_startup_blocks]WpBlock,
+    startup_count: usize = 0,
     /// A frame retained after a caller supplied an undersized output buffer.
-    pending_frame: ?PcmFrame = null,
+    pending_frame: ?PcmRef = null,
+
+    /// Initialize every field for a handle that is not yet ready for use.
+    /// The C ABI and tests use this before the first init() call.
+    pub fn initUninitialized(self: *Reader) void {
+        self.* = .{
+            .transport = .{},
+            // SAFETY: init() assigns the caller allocator before the queues run.
+            .block_queue = .{ .allocator = undefined },
+            // SAFETY: init() assigns the caller allocator before the queues run.
+            .pcm_out_queue = .{ .allocator = undefined },
+            // SAFETY: init() assigns the caller allocator before the queues run.
+            .free_slots = .{ .allocator = undefined },
+            // SAFETY: the decode thread writes each slot before readFrame reads it.
+            .pcm_pool = undefined,
+            // SAFETY: the started flags gate every join and these handles are
+            // assigned before the corresponding flag becomes true.
+            .recv_thread = undefined,
+            // SAFETY: the started flags gate every join and these handles are
+            // assigned before the corresponding flag becomes true.
+            .decode_thread = undefined,
+            .sctp_cfg = .{},
+            // SAFETY: init() assigns the caller allocator before any allocation.
+            .allocator = undefined,
+            // SAFETY: recvConfig() fills a slot before start() reads it.
+            .startup_blocks = undefined,
+        };
+    }
+
+    fn lifecycleLoad(self: *const Reader) Lifecycle {
+        return self.lifecycle.load(.acquire);
+    }
+
+    fn lifecycleStore(self: *Reader, value: Lifecycle) void {
+        self.lifecycle.store(value, .release);
+    }
 
     /// Configuration for a Reader.
     pub const Config = struct {
@@ -107,57 +168,71 @@ pub const Reader = struct {
     };
 
     /// Initialize the reader, bind it to `bind_addr`, and listen for senders.
-    /// The supplied Io context must outlive the Reader.
-    pub fn init(self: *Reader, cfg: Config, bind_addr: SocketAddr, io: std.Io) !void {
-        if (self.lifecycle != .uninitialized) return error.AlreadyInitialized;
-        self.lifecycle = .initializing;
+    /// The supplied allocator and Io context must outlive the Reader.
+    /// Call initUninitialized() first when the storage is uninitialized.
+    pub fn init(
+        self: *Reader,
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        bind_addr: SocketAddr,
+        io: std.Io,
+    ) !void {
+        if (self.lifecycleLoad() != .uninitialized) return error.AlreadyInitialized;
+        self.lifecycleStore(.initializing);
         self.recv_thread_started = false;
         self.decode_thread_started = false;
         self.transport_initialized = false;
         self.block_queue_initialized = false;
         self.pcm_queue_initialized = false;
+        self.free_queue_initialized = false;
         self.session_active = false;
         self.config_received = false;
         self.stream_config = null;
-        self.startup_blocks = .empty;
+        self.startup_count = 0;
         self.pending_frame = null;
-        self.bg_err = null;
-        self.bg_err_mutex = .init;
+        self.bg_err = .{};
         self.sctp_cfg = cfg.sctp;
         self.io = io;
+        self.allocator = allocator;
         errdefer {
             self.cleanup();
-            self.lifecycle = .uninitialized;
+            self.lifecycleStore(.uninitialized);
         }
 
         const num_sctp_streams: u16 = 2;
         self.transport = try sctp.SctpReceiver.init(bind_addr, num_sctp_streams, cfg.sctp, io);
         self.transport_initialized = true;
-        // Allocate placeholder queues. start() replaces them at the final depth.
-        self.block_queue = try BoundedQueue(WpBlock).init(alloc, io, 1);
+        // Allocate placeholder queues. start() replaces the block queue at the
+        // final depth and resets the fixed-size PCM queues.
+        self.block_queue = try BoundedQueue(WpBlock).init(self.allocator, io, 1);
         self.block_queue_initialized = true;
-        self.pcm_out_queue = try BoundedQueue(PcmFrame).init(alloc, io, pcm_out_queue_depth);
+        self.pcm_out_queue = try BoundedQueue(PcmRef).init(self.allocator, io, pcm_pool_slots);
         self.pcm_queue_initialized = true;
-        self.lifecycle = .initialized;
+        self.free_slots = try BoundedQueue(u8).init(self.allocator, io, pcm_pool_slots);
+        self.free_queue_initialized = true;
+        for (0..pcm_pool_slots) |i|
+            try self.free_slots.push(@intCast(i));
+        self.lifecycleStore(.initialized);
     }
 
     /// Accept one incoming SCTP association.
     /// Block until a sender connects. This does not start either background
     /// thread. Call `recvConfig()` and then `start()`.
     pub fn accept(self: *Reader, cfg: Config) !void {
-        if (self.lifecycle != .initialized or self.session_active) return error.InvalidState;
+        if (self.lifecycleLoad() != .initialized or self.session_active) return error.InvalidState;
         try self.transport.accept(cfg.sctp);
         self.sctp_cfg = cfg.sctp;
         self.session_active = true;
         self.config_received = false;
         self.stream_config = null;
+        self.startup_count = 0;
     }
 
     /// Read stream configuration from SCTP stream 0.
     /// Block until the control message arrives. Call after `accept()` and
     /// before `start()`.
     pub fn recvConfig(self: *Reader) !StreamConfig {
-        if (self.lifecycle != .initialized or !self.session_active) return error.InvalidState;
+        if (self.lifecycleLoad() != .initialized or !self.session_active) return error.InvalidState;
         if (self.config_received) return self.stream_config.?;
 
         var buf: [max_recv_buf]u8 = undefined;
@@ -173,12 +248,8 @@ pub const Reader = struct {
                 if (!std.mem.eql(u8, &msg._pad0, &[_]u8{ 0, 0, 0 }) or msg._pad1 != 0) {
                     return error.ProtocolError;
                 }
-                if (msg.sample_rate == 0 or
-                    (msg.num_channels != 1 and msg.num_channels != 2) or
-                    (msg.bits_per_sample != 16 and msg.bits_per_sample != 24))
-                {
+                wpstream.validateFormat(msg.sample_rate, msg.num_channels, msg.bits_per_sample) catch
                     return error.ProtocolError;
-                }
                 const cfg = StreamConfig{
                     .sample_rate = msg.sample_rate,
                     .num_channels = msg.num_channels,
@@ -191,19 +262,18 @@ pub const Reader = struct {
 
             if (result.stream_id != 1) return error.ProtocolError;
             _ = wpstream.validateBlock(buf[0..result.len]) catch return error.ProtocolError;
-            if (self.startup_blocks.items.len >= max_startup_blocks) return error.ProtocolError;
-            const copy = alloc.dupe(u8, buf[0..result.len]) catch return error.OutOfMemory;
-            self.startup_blocks.append(alloc, .{ .data = copy }) catch {
-                alloc.free(copy);
-                return error.OutOfMemory;
-            };
+            if (self.startup_count >= max_startup_blocks) return error.ProtocolError;
+            self.startup_blocks[self.startup_count] = newWpBlock(buf[0..result.len]);
+            self.startup_count += 1;
         }
     }
 
     /// Check for a new sender without blocking.
     /// When true, the next `nextSession()` call uses the pending connection.
     pub fn checkNewSender(self: *Reader) bool {
-        if (self.lifecycle != .initialized and self.lifecycle != .running) return false;
+        const state = self.lifecycleLoad();
+        if (state != .initialized and state != .running) return false;
+        if (!self.session_active) return false;
         return self.transport.tryAcceptNew(self.sctp_cfg);
     }
 
@@ -211,7 +281,8 @@ pub const Reader = struct {
     /// The value changes after `accept()` and `nextSession()`.
     /// It is cleared when the connection closes.
     pub fn peerAddress(self: *const Reader) ?sctp.SocketAddr {
-        if (self.lifecycle == .uninitialized or self.lifecycle == .initializing) return null;
+        const state = self.lifecycleLoad();
+        if (state == .uninitialized or state == .initializing) return null;
         return self.transport.peerAddress();
     }
 
@@ -219,9 +290,10 @@ pub const Reader = struct {
     /// Promote a pending connection when one exists. Otherwise, block in
     /// `accept()` until a new sender connects. Return its stream configuration.
     pub fn nextSession(self: *Reader) !StreamConfig {
-        if (self.lifecycle != .initialized and self.lifecycle != .running) return error.InvalidState;
+        const state = self.lifecycleLoad();
+        if (state != .initialized and state != .running) return error.InvalidState;
         self.stopSession();
-        self.bg_err = null;
+        self.bg_err.clear(self.io);
         self.session_active = false;
         self.config_received = false;
         self.stream_config = null;
@@ -240,59 +312,58 @@ pub const Reader = struct {
     /// The decode thread pre-fills the queue to this depth before decoding.
     /// The value must be at least 1.
     pub fn start(self: *Reader, buffer_depth: usize) !void {
-        if (self.lifecycle != .initialized) return error.InvalidState;
+        if (self.lifecycleLoad() != .initialized) return error.InvalidState;
         if (!self.session_active or !self.config_received) return error.InvalidState;
         if (self.recv_thread_started or self.decode_thread_started) return error.AlreadyStarted;
         if (buffer_depth < 1) return error.InvalidDepth;
         if (buffer_depth > max_buffer_depth) return error.InvalidDepth;
-        const depth = @max(buffer_depth, self.startup_blocks.items.len);
+        const depth = @max(buffer_depth, self.startup_count);
 
-        // Create replacement queues before releasing the old storage.
-        var new_block_queue = try BoundedQueue(WpBlock).init(alloc, self.io, depth);
+        // Create the replacement block queue before releasing the old storage.
+        var new_block_queue = try BoundedQueue(WpBlock).init(self.allocator, self.io, depth);
         var new_block_owned = true;
         errdefer if (new_block_owned) new_block_queue.deinit();
-        var new_pcm_queue = try BoundedQueue(PcmFrame).init(alloc, self.io, pcm_out_queue_depth);
-        var new_pcm_owned = true;
-        errdefer if (new_pcm_owned) new_pcm_queue.deinit();
 
         self.block_queue.close();
         self.pcm_out_queue.close();
+        if (self.free_queue_initialized) self.free_slots.close();
         self.drainQueues();
         // Re-create the block queue at the requested depth.
         self.block_queue.deinit();
         self.block_queue = new_block_queue;
         new_block_owned = false;
         self.block_queue_initialized = true;
-        // Re-create the PCM output queue at its fixed depth.
-        self.pcm_out_queue.deinit();
-        self.pcm_out_queue = new_pcm_queue;
-        new_pcm_owned = false;
-        self.pcm_queue_initialized = true;
+        // The PCM and free queues have fixed capacities. Reuse their storage.
+        self.pcm_out_queue.reset();
+        self.free_slots.reset();
+        for (0..pcm_pool_slots) |i|
+            try self.free_slots.push(@intCast(i));
 
-        for (self.startup_blocks.items) |block| {
-            try self.block_queue.push(block);
-        }
-        self.startup_blocks.clearRetainingCapacity();
+        // Transfer startup blocks. The block queue capacity covers them.
+        for (0..self.startup_count) |i|
+            try self.block_queue.push(self.startup_blocks[i]);
+        self.startup_count = 0;
 
         // Start both background threads.
         self.recv_thread = try std.Thread.spawn(.{}, recvLoop, .{self});
         self.recv_thread_started = true;
         errdefer {
             self.stopSession();
-            self.lifecycle = .initialized;
+            self.lifecycleStore(.initialized);
         }
         self.decode_thread = try std.Thread.spawn(.{}, decodeLoop, .{self});
         self.decode_thread_started = true;
-        self.lifecycle = .running;
+        self.lifecycleStore(.running);
     }
 
     /// Copy the next decoded PCM block into `out_buf`.
     /// Return the number of interleaved i32 values written.
     /// Block until a decoded block is available or the session ends.
+    /// Call from one consumer thread only.
     pub fn readFrame(self: *Reader, out_buf: []i32) !u32 {
-        if (self.lifecycle != .running) return error.NotInitialized;
+        if (self.lifecycleLoad() != .running) return error.InvalidState;
         try self.checkBgErr();
-        const frame = if (self.pending_frame) |pending| blk: {
+        const ref = if (self.pending_frame) |pending| blk: {
             self.pending_frame = null;
             break :blk pending;
         } else self.pcm_out_queue.pop() catch |e| switch (e) {
@@ -302,13 +373,30 @@ pub const Reader = struct {
             },
             error.Canceled => return error.QueueCanceled,
         };
-        if (frame.samples.len > out_buf.len) {
-            self.pending_frame = frame;
+        if (ref.len > out_buf.len) {
+            self.pending_frame = ref;
             return error.BufferTooSmall;
         }
-        defer alloc.free(frame.samples);
-        @memcpy(out_buf[0..frame.samples.len], frame.samples);
-        return @intCast(frame.samples.len);
+        defer self.releasePcmSlot(ref.slot);
+        @memcpy(out_buf[0..ref.len], self.pcm_pool[ref.slot][0..ref.len]);
+        return @intCast(ref.len);
+    }
+
+    /// Return one decoded slot to the free list.
+    fn releasePcmSlot(self: *Reader, slot: u8) void {
+        if (!self.free_queue_initialized) return;
+        self.free_slots.push(slot) catch |err| switch (err) {
+            // Teardown closes the queue. The pool is reset at the next start.
+            error.Closed => {},
+            error.Canceled => {},
+        };
+    }
+
+    /// Return the value count required by a frame retained after a
+    /// buffer-too-small error, or null when no frame is retained.
+    pub fn pendingFrameLen(self: *const Reader) ?u32 {
+        if (self.pending_frame) |ref| return @intCast(ref.len);
+        return null;
     }
 
     /// Request shutdown of sockets and close queues to stop blocked reader operations.
@@ -316,60 +404,69 @@ pub const Reader = struct {
     /// `recv()`. The usrsctp backend cannot reliably wake a blocked `accept()`.
     /// Call `deinit()` after any background threads have exited.
     pub fn cancel(self: *Reader) void {
-        if (self.lifecycle == .uninitialized) return;
+        const state = self.lifecycleLoad();
+        if (state == .uninitialized or state == .initializing) return;
         if (self.transport_initialized) self.transport.cancel();
         if (self.block_queue_initialized) self.block_queue.close();
         if (self.pcm_queue_initialized) self.pcm_out_queue.close();
+        if (self.free_queue_initialized) self.free_slots.close();
     }
 
     /// Stop all reader threads and release queue and transport resources.
     pub fn deinit(self: *Reader) void {
-        if (self.lifecycle == .uninitialized) return;
+        if (self.lifecycleLoad() == .uninitialized) return;
         self.cleanup();
-        self.lifecycle = .uninitialized;
+        self.lifecycleStore(.uninitialized);
     }
 
     fn checkBgErr(self: *Reader) !void {
-        if (self.lifecycle == .uninitialized) return error.NotInitialized;
-        self.bg_err_mutex.lockUncancelable(self.io);
-        defer self.bg_err_mutex.unlock(self.io);
-        if (self.bg_err) |e| return e;
+        if (self.lifecycleLoad() == .uninitialized) return error.NotInitialized;
+        try self.bg_err.check(self.io);
     }
 
     fn setBgErr(self: *Reader, e: anyerror) void {
-        self.bg_err_mutex.lockUncancelable(self.io);
-        defer self.bg_err_mutex.unlock(self.io);
-        if (self.bg_err == null) self.bg_err = e;
+        _ = self.bg_err.record(self.io, e);
     }
 
     fn failBackground(self: *Reader, e: anyerror) void {
         self.setBgErr(e);
         if (self.block_queue_initialized) self.block_queue.close();
         if (self.pcm_queue_initialized) self.pcm_out_queue.close();
+        if (self.free_queue_initialized) self.free_slots.close();
     }
 
-    fn freeStartupBlocks(self: *Reader) void {
-        for (self.startup_blocks.items) |block| alloc.free(block.data);
-        self.startup_blocks.clearRetainingCapacity();
+    fn resetStartupBlocks(self: *Reader) void {
+        self.startup_count = 0;
     }
 
     fn drainQueues(self: *Reader) void {
         if (self.block_queue_initialized) {
             while (true) {
-                const block = self.block_queue.pop() catch break;
-                alloc.free(block.data);
+                _ = self.block_queue.pop() catch |err| switch (err) {
+                    error.Closed => break,
+                    error.Canceled => continue,
+                };
             }
         }
         if (self.pcm_queue_initialized) {
             while (true) {
-                const frame = self.pcm_out_queue.pop() catch break;
-                alloc.free(frame.samples);
+                _ = self.pcm_out_queue.pop() catch |err| switch (err) {
+                    error.Closed => break,
+                    error.Canceled => continue,
+                };
+            }
+        }
+        if (self.free_queue_initialized) {
+            while (true) {
+                _ = self.free_slots.pop() catch |err| switch (err) {
+                    error.Closed => break,
+                    error.Canceled => continue,
+                };
             }
         }
     }
 
     fn clearPendingFrame(self: *Reader) void {
-        if (self.pending_frame) |frame| alloc.free(frame.samples);
         self.pending_frame = null;
     }
 
@@ -379,6 +476,7 @@ pub const Reader = struct {
         }
         if (self.block_queue_initialized) self.block_queue.close();
         if (self.pcm_queue_initialized) self.pcm_out_queue.close();
+        if (self.free_queue_initialized) self.free_slots.close();
         if (self.recv_thread_started) {
             self.recv_thread.join();
             self.recv_thread_started = false;
@@ -390,17 +488,18 @@ pub const Reader = struct {
         self.transport.closeConn();
         self.drainQueues();
         self.clearPendingFrame();
-        self.freeStartupBlocks();
+        self.resetStartupBlocks();
         self.session_active = false;
         self.config_received = false;
         self.stream_config = null;
-        self.lifecycle = .initialized;
+        self.lifecycleStore(.initialized);
     }
 
     fn cleanup(self: *Reader) void {
         if (self.transport_initialized) self.transport.shutdown();
         if (self.block_queue_initialized) self.block_queue.close();
         if (self.pcm_queue_initialized) self.pcm_out_queue.close();
+        if (self.free_queue_initialized) self.free_slots.close();
         if (self.recv_thread_started) {
             self.recv_thread.join();
             self.recv_thread_started = false;
@@ -411,9 +510,7 @@ pub const Reader = struct {
         }
         self.drainQueues();
         self.clearPendingFrame();
-        self.freeStartupBlocks();
-        self.startup_blocks.deinit(alloc);
-        self.startup_blocks = .empty;
+        self.resetStartupBlocks();
         if (self.block_queue_initialized) {
             self.block_queue.deinit();
             self.block_queue_initialized = false;
@@ -421,6 +518,10 @@ pub const Reader = struct {
         if (self.pcm_queue_initialized) {
             self.pcm_out_queue.deinit();
             self.pcm_queue_initialized = false;
+        }
+        if (self.free_queue_initialized) {
+            self.free_slots.deinit();
+            self.free_queue_initialized = false;
         }
         if (self.transport_initialized) {
             self.transport.close();
@@ -456,25 +557,17 @@ pub const Reader = struct {
                 break;
             };
 
-            const copy = alloc.dupe(u8, data) catch |e| {
-                self.failBackground(e);
-                break;
-            };
-            self.block_queue.push(.{ .data = copy }) catch {
-                alloc.free(copy);
-                break;
-            };
+            self.block_queue.push(newWpBlock(data)) catch break;
         }
     }
 
     /// Run the decode thread.
-    /// Prime `block_queue`, decode blocks, and push PCM into `pcm_out_queue`.
+    /// Prime `block_queue`, decode blocks into the fixed PCM pool, and push
+    /// slot references into `pcm_out_queue`.
     ///
-    /// Reuse a decode buffer that grows to the largest block seen.
-    /// Only the final PCM slice needs a per-block allocation.
-    ///
-    /// Exit when `block_queue` closes or `pcm_out_queue` closes.
-    /// Always close `pcm_out_queue` so `readFrame()` can return.
+    /// Exit when `block_queue` closes, `free_slots` closes, or
+    /// `pcm_out_queue` closes. Always close `pcm_out_queue` so `readFrame()`
+    /// can return.
     fn decodeLoop(self: *Reader) void {
         defer self.pcm_out_queue.close();
         // Prime the jitter buffer before decoding.
@@ -483,17 +576,14 @@ pub const Reader = struct {
             return;
         };
 
-        // Reusable decode buffer. Grow it to the largest block seen.
-        var decode_buf: []i32 = &.{};
-        defer if (decode_buf.len > 0) alloc.free(decode_buf);
         var first_block = true;
 
         while (true) {
             const block = self.block_queue.pop() catch break;
-            defer alloc.free(block.data);
+            const data = block.slice();
 
             // Read the header to determine the required decode size.
-            const header = wpstream.validateBlock(block.data) catch {
+            const header = wpstream.validateBlock(data) catch {
                 self.failBackground(error.ProtocolError);
                 return;
             };
@@ -507,21 +597,14 @@ pub const Reader = struct {
                     self.failBackground(error.ProtocolError);
                     return;
                 };
-                const block_channels = wpstream.Decoder.getNumChannels(block.data) catch {
+                const info = wpstream.Decoder.getInfo(data) catch {
                     self.failBackground(error.ProtocolError);
                     return;
                 };
-                const block_rate = wpstream.Decoder.getSampleRate(block.data) catch {
-                    self.failBackground(error.ProtocolError);
-                    return;
-                };
-                const block_bits = wpstream.Decoder.getBitsPerSample(block.data) catch {
-                    self.failBackground(error.ProtocolError);
-                    return;
-                };
-                if (block_channels != cfg.num_channels or
-                    block_rate != cfg.sample_rate or
-                    block_bits != cfg.bits_per_sample)
+                if (info.num_channels != cfg.num_channels or
+                    info.sample_rate != cfg.sample_rate or
+                    info.bits_per_sample != cfg.bits_per_sample or
+                    info.frame_samples != header.block_samples)
                 {
                     self.failBackground(error.ProtocolError);
                     return;
@@ -529,29 +612,31 @@ pub const Reader = struct {
                 first_block = false;
             }
 
-            // Grow the decode buffer when needed.
-            if (needed > decode_buf.len) {
-                if (decode_buf.len > 0) alloc.free(decode_buf);
-                decode_buf = alloc.alloc(i32, needed) catch {
-                    self.failBackground(error.OutOfMemory);
-                    return;
-                };
-            }
-
-            const n = wpstream.Decoder.decodeFrame(block.data, decode_buf[0..needed]) catch |e| {
+            const slot = self.free_slots.pop() catch break;
+            const n = wpstream.Decoder.decodeFrame(
+                data,
+                self.pcm_pool[slot][0..needed],
+            ) catch |e| {
+                self.releasePcmSlot(slot);
                 self.failBackground(e);
                 return;
             };
-            if (n == 0) continue;
+            if (n == 0) {
+                self.releasePcmSlot(slot);
+                continue;
+            }
 
-            const copy = alloc.dupe(i32, decode_buf[0..n]) catch {
-                self.failBackground(error.OutOfMemory);
-                return;
-            };
-            self.pcm_out_queue.push(.{ .samples = copy }) catch {
-                alloc.free(copy);
+            self.pcm_out_queue.push(.{ .slot = slot, .len = n }) catch {
+                self.releasePcmSlot(slot);
                 break;
             };
         }
     }
 };
+
+test "pendingFrameLen reports a retained frame size" {
+    var reader: Reader = undefined;
+    reader.initUninitialized();
+    reader.pending_frame = .{ .slot = 0, .len = 4 };
+    try std.testing.expectEqual(4, reader.pendingFrameLen().?);
+}

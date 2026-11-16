@@ -1,4 +1,5 @@
 const std = @import("std");
+const protocol = @import("protocol.zig");
 
 /// C bindings for WavPack-stream.
 /// The build creates them with TranslateC from `src/c/wavpack-stream.zig.h`.
@@ -52,8 +53,12 @@ pub fn parseBlockHeader(data: []const u8) !BlockHeader {
 
 /// Parse and validate one complete little-endian WavPack block.
 pub fn validateBlock(data: []const u8) !BlockHeader {
+    if (data.len > protocol.max_wire_block_bytes) return error.InvalidBlock;
     const header = try parseBlockHeader(data);
     if (@as(usize, header.ck_size) + 6 != data.len) return error.InvalidBlock;
+    const channels: usize = if ((header.flags & BlockHeader.MONO_FLAG) != 0) 1 else 2;
+    if (@as(usize, header.block_samples) * channels > protocol.max_decoded_samples)
+        return error.InvalidBlock;
     return header;
 }
 
@@ -92,6 +97,19 @@ pub const ConfigFlags = packed struct(i32) {
     _reserved17: u15 = 0, // Bits 17-31.
 };
 
+/// Validate the stream format shared by the encoder and control channel.
+pub fn validateFormat(sample_rate: u32, num_channels: u16, bits_per_sample: u8) !void {
+    if (sample_rate == 0 or sample_rate > 2_147_483_647) {
+        return error.UnsupportedConfig;
+    }
+    if (num_channels < 1 or num_channels > 2) {
+        return error.UnsupportedConfig;
+    }
+    if (bits_per_sample != 16 and bits_per_sample != 24) {
+        return error.UnsupportedConfig;
+    }
+}
+
 /// WavPack encoder configuration.
 /// It controls the PCM format, compression quality, and block size.
 /// Writer computes `block_bytes` from the SCTP maximum segment size.
@@ -117,15 +135,7 @@ pub const Config = struct {
 
     /// Validate values that are narrowed into the C configuration structure.
     pub fn validate(self: Config) !void {
-        if (self.sample_rate == 0 or self.sample_rate > 2_147_483_647) {
-            return error.UnsupportedConfig;
-        }
-        if (self.num_channels < 1 or self.num_channels > 2) {
-            return error.UnsupportedConfig;
-        }
-        if (self.bits_per_sample != 16 and self.bits_per_sample != 24) {
-            return error.UnsupportedConfig;
-        }
+        try validateFormat(self.sample_rate, self.num_channels, self.bits_per_sample);
         if (self.block_bytes < 0 or
             (self.block_bytes != 0 and (self.block_bytes < 256 or self.block_bytes > 16384)))
         {
@@ -188,6 +198,8 @@ pub const Encoder = struct {
     block_output: BlockOutputFn,
     /// Opaque callback context.
     user_ctx: ?*anyopaque,
+    /// Interleaved channel count from the active configuration.
+    num_channels: u16 = 0,
 
     /// Initialize the encoder in place with `cfg`.
     /// The Encoder must already be at its final memory location.
@@ -222,6 +234,7 @@ pub const Encoder = struct {
         if (c.WavpackStreamPackInit(wpc) == 0) {
             return error.WavpackPackInitFailed;
         }
+        self.num_channels = cfg.num_channels;
     }
 
     /// Feed interleaved PCM values widened to i32 into the encoder.
@@ -229,9 +242,8 @@ pub const Encoder = struct {
     /// The callback runs for each completed block.
     pub fn packSamples(self: *Encoder, sample_buffer: []i32) !void {
         const wpc = self.wpc orelse return error.NotInitialized;
-        const channels_raw = c.WavpackStreamGetNumChannels(wpc);
-        if (channels_raw <= 0) return error.WavpackConfigFailed;
-        const channels: usize = @intCast(channels_raw);
+        if (self.num_channels == 0) return error.WavpackConfigFailed;
+        const channels: usize = self.num_channels;
         if (sample_buffer.len % channels != 0) return error.InvalidSampleCount;
         const frame_count = sample_buffer.len / channels;
         if (frame_count > std.math.maxInt(u32)) return error.InputTooLarge;
@@ -261,6 +273,7 @@ pub const Encoder = struct {
             _ = c.WavpackStreamCloseFile(wpc);
             self.wpc = null;
         }
+        self.num_channels = 0;
     }
 
     /// Bridge the C blockout callback to BlockOutputFn.
@@ -279,15 +292,16 @@ pub const Encoder = struct {
 /// Stateless WavPack block decoder.
 /// Each method opens a temporary C decoder context, performs its operation,
 /// and closes the context. Each WavPack-stream block is self-contained.
+/// No allocation happens.
 pub const Decoder = struct {
     /// Validate a block and enable WavPack checksum verification before opening
     /// the raw decoder. The vendored raw-decoder API disables checksums itself.
     fn openRawDecoder(frame_data: []const u8) !*c.WavpackContext {
         _ = try validateBlock(frame_data);
 
-        const verify_buf = try std.heap.c_allocator.dupe(u8, frame_data);
-        defer std.heap.c_allocator.free(verify_buf);
-        if (c.WavpackStreamVerifySingleBlock(verify_buf.ptr, 1) == 0) {
+        var verify_buf: [protocol.max_wire_block_bytes]u8 = undefined;
+        @memcpy(verify_buf[0..frame_data.len], frame_data);
+        if (c.WavpackStreamVerifySingleBlock(verify_buf[0..].ptr, 1) == 0) {
             return error.InvalidBlock;
         }
 
@@ -301,6 +315,33 @@ pub const Decoder = struct {
             0,
             0,
         ) orelse return error.WavpackDecodeFailed;
+    }
+
+    /// Metadata read from one block without decoding PCM.
+    pub const Info = struct {
+        num_channels: u32,
+        sample_rate: u32,
+        bits_per_sample: u32,
+        frame_samples: u32,
+    };
+
+    /// Read all block metadata with one decoder context.
+    pub fn getInfo(frame_data: []const u8) !Info {
+        const wpc = try openRawDecoder(frame_data);
+        defer _ = c.WavpackStreamCloseFile(wpc);
+
+        const channels = c.WavpackStreamGetNumChannels(wpc);
+        if (channels <= 0) return error.InvalidBlock;
+        const sample_rate = c.WavpackStreamGetSampleRate(wpc);
+        if (sample_rate == 0) return error.InvalidBlock;
+        const bits = c.WavpackStreamGetBitsPerSample(wpc);
+        if (bits <= 0) return error.InvalidBlock;
+        return .{
+            .num_channels = @intCast(channels),
+            .sample_rate = sample_rate,
+            .bits_per_sample = @intCast(bits),
+            .frame_samples = c.WavpackStreamGetNumSamplesInFrame(wpc),
+        };
     }
 
     /// Decode one block into interleaved i32 PCM values.
@@ -327,40 +368,11 @@ pub const Decoder = struct {
         if (unpacked > frame_samples) return error.InvalidBlock;
         return @intCast(@as(usize, unpacked) * num_channels);
     }
-
-    /// Read the channel count from a block without decoding audio.
-    pub fn getNumChannels(frame_data: []const u8) !u32 {
-        const wpc = try openRawDecoder(frame_data);
-        defer _ = c.WavpackStreamCloseFile(wpc);
-
-        const channels = c.WavpackStreamGetNumChannels(wpc);
-        if (channels <= 0) return error.InvalidBlock;
-        return @intCast(channels);
-    }
-
-    /// Read the sample rate from a block without decoding audio.
-    pub fn getSampleRate(frame_data: []const u8) !u32 {
-        const wpc = try openRawDecoder(frame_data);
-        defer _ = c.WavpackStreamCloseFile(wpc);
-
-        const sample_rate = c.WavpackStreamGetSampleRate(wpc);
-        if (sample_rate == 0) return error.InvalidBlock;
-        return sample_rate;
-    }
-
-    /// Read the bit depth from a block without decoding audio.
-    pub fn getBitsPerSample(frame_data: []const u8) !u32 {
-        const wpc = try openRawDecoder(frame_data);
-        defer _ = c.WavpackStreamCloseFile(wpc);
-
-        const bits = c.WavpackStreamGetBitsPerSample(wpc);
-        if (bits <= 0) return error.InvalidBlock;
-        return @intCast(bits);
-    }
 };
 
-test "BlockHeader layout" {
-    try std.testing.expectEqual(@sizeOf(BlockHeader), 12);
+comptime {
+    // The header parser and the block delimiters rely on this layout.
+    std.debug.assert(@sizeOf(BlockHeader) == 12);
 }
 
 test "parseBlockHeader validates complete wire blocks" {
@@ -385,6 +397,18 @@ test "parseBlockHeader validates complete wire blocks" {
 
     std.mem.writeInt(u16, block[4..6], 7, .little);
     try std.testing.expectError(error.InvalidBlock, parseBlockHeader(&block));
+}
+
+test "validateBlock rejects oversized decoded frames" {
+    var block: [12]u8 = undefined;
+    @memcpy(block[0..4], "wpsb");
+    std.mem.writeInt(u16, block[4..6], 6, .little); // Header-only block.
+    std.mem.writeInt(u16, block[6..8], 8193, .little); // 8193 stereo frames.
+    std.mem.writeInt(u32, block[8..12], 0, .little); // Stereo.
+    try std.testing.expectError(error.InvalidBlock, validateBlock(&block));
+
+    std.mem.writeInt(u16, block[6..8], 8000, .little);
+    _ = try validateBlock(&block);
 }
 
 test "Encoder round-trip" {
@@ -705,7 +729,7 @@ test "block_bytes limits block size" {
     try testing.expect(ctx.max_block_size <= @as(usize, @intCast(target_block_bytes)));
 }
 
-test "Decoder metadata queries" {
+test "Decoder getInfo reads all metadata once" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
@@ -724,14 +748,13 @@ test "Decoder metadata queries" {
     }, &input);
     defer frame_buf.deinit(allocator);
 
-    // Find the first encoded block.
     const ck_size = std.mem.readInt(u16, frame_buf.items[4..6], .little);
     const frame_end = @as(usize, ck_size) + 6;
-    const first_frame = frame_buf.items[0..frame_end];
-
-    try testing.expectEqual(try Decoder.getNumChannels(first_frame), 2);
-    try testing.expectEqual(try Decoder.getSampleRate(first_frame), 44100);
-    try testing.expectEqual(try Decoder.getBitsPerSample(first_frame), 16);
+    const info = try Decoder.getInfo(frame_buf.items[0..frame_end]);
+    try testing.expectEqual(2, info.num_channels);
+    try testing.expectEqual(44100, info.sample_rate);
+    try testing.expectEqual(16, info.bits_per_sample);
+    try testing.expect(info.frame_samples > 0);
 }
 
 test "Config.resolveChannelMask" {

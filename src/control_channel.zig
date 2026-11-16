@@ -64,8 +64,9 @@ pub const CtrlMsg = extern struct {
     }
 };
 
-test "CtrlMsg layout size" {
-    try std.testing.expectEqual(@sizeOf(CtrlMsg), 16);
+comptime {
+    // The writer sends CtrlMsg as one raw 16-byte message.
+    std.debug.assert(@sizeOf(CtrlMsg) == 16);
 }
 
 test "CtrlMsg round-trip serialization" {

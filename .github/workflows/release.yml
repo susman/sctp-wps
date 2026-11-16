@@ -17,6 +17,11 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
       - name: Create package tarball
         id: tarball
         run: |
@@ -42,13 +47,10 @@ jobs:
           done
           echo "path=${archive}" >> "$GITHUB_OUTPUT"
 
-      - name: Install Zig
+      - name: Build and test
         run: |
-          curl -fsSLo /tmp/zig.tar.xz \
-            https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-          mkdir -p /tmp/zig
-          tar -xJf /tmp/zig.tar.xz -C /tmp/zig --strip-components=1
-          echo /tmp/zig >> "${GITHUB_PATH}"
+          zig build
+          zig build test
 
       - name: Validate package
         run: zig fetch "${{ steps.tarball.outputs.path }}" > /dev/null

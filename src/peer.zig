@@ -25,30 +25,28 @@ const root = @import("root.zig");
 const Writer = root.Writer;
 const Reader = root.Reader;
 
-const alloc = std.heap.c_allocator;
-
 /// Run one peer mode from the command line.
 pub fn main(init: std.process.Init) !void {
     const io_inst = init.io;
-    io_global = io_inst;
+    const allocator = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 4) {
-        print("usage: peer <mode> <sctp_port> <count> [channels] [udp_local] [udp_remote]\n", .{});
+        print(io_inst, "usage: peer <mode> <sctp_port> <count> [channels] [udp_local] [udp_remote]\n", .{});
         std.process.exit(1);
     }
 
     const mode = args[1];
-    const sctp_port = std.fmt.parseInt(u16, args[2], 10) catch fail("bad sctp_port");
-    const count_arg = std.fmt.parseInt(usize, args[3], 10) catch fail("bad count");
-    const channels_arg: u16 = if (args.len > 4) (std.fmt.parseInt(u16, args[4], 10) catch fail("bad channels")) else 2;
-    const udp_local: u16 = if (args.len > 5) (std.fmt.parseInt(u16, args[5], 10) catch fail("bad udp_local")) else 9899;
-    const udp_remote: u16 = if (args.len > 6) (std.fmt.parseInt(u16, args[6], 10) catch fail("bad udp_remote")) else 9899;
+    const sctp_port = std.fmt.parseInt(u16, args[2], 10) catch fail(io_inst, "bad sctp_port");
+    const count_arg = std.fmt.parseInt(usize, args[3], 10) catch fail(io_inst, "bad count");
+    const channels_arg: u16 = if (args.len > 4) (std.fmt.parseInt(u16, args[4], 10) catch fail(io_inst, "bad channels")) else 2;
+    const udp_local: u16 = if (args.len > 5) (std.fmt.parseInt(u16, args[5], 10) catch fail(io_inst, "bad udp_local")) else 9899;
+    const udp_remote: u16 = if (args.len > 6) (std.fmt.parseInt(u16, args[6], 10) catch fail(io_inst, "bad udp_remote")) else 9899;
 
     if ((std.mem.eql(u8, mode, "writer") or std.mem.eql(u8, mode, "reader")) and
         (channels_arg != 1 and channels_arg != 2))
     {
-        fail("channels must be 1 or 2");
+        fail(io_inst, "channels must be 1 or 2");
     }
 
     if (std.mem.eql(u8, mode, "sender")) {
@@ -56,44 +54,39 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "receiver")) {
         try runReceiver(io_inst, sctp_port, count_arg, udp_local, udp_remote);
     } else if (std.mem.eql(u8, mode, "writer")) {
-        try runWriter(io_inst, sctp_port, count_arg, channels_arg, udp_local, udp_remote);
+        try runWriter(io_inst, allocator, sctp_port, count_arg, channels_arg, udp_local, udp_remote);
     } else if (std.mem.eql(u8, mode, "reader")) {
-        try runReader(io_inst, sctp_port, count_arg, channels_arg, udp_local, udp_remote);
+        try runReader(io_inst, allocator, sctp_port, count_arg, channels_arg, udp_local, udp_remote);
     } else {
-        fail("unknown mode");
+        fail(io_inst, "unknown mode");
     }
 }
 
-fn print(comptime fmt: []const u8, args: anytype) void {
+fn print(io_inst: std.Io, comptime fmt: []const u8, args: anytype) void {
     // The test runner reads status lines from stdout.
     var buf: [256]u8 = undefined;
     const written = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    std.Io.File.stdout().writeStreamingAll(io_global, written) catch |e|
-        std.log.err("peer stdout write failed: {}", .{e});
+    std.Io.File.stdout().writeStreamingAll(io_inst, written) catch |e|
+        std.log.err("peer stdout write failed: {t}", .{e});
 }
 
-// SAFETY: main() assigns io_global before print() or fail() reads it.
-var io_global: std.Io = undefined;
-
-fn fail(msg: []const u8) noreturn {
-    print("ERROR {s}\n", .{msg});
+fn fail(io_inst: std.Io, msg: []const u8) noreturn {
+    print(io_inst, "ERROR {s}\n", .{msg});
     std.process.exit(1);
 }
 
-const Pattern = struct {
-    /// Return the test byte at a stream position.
-    pub fn byteAt(pos: usize) u8 {
-        return @intCast(pos % 256);
-    }
-};
+/// Return the test byte at a stream position.
+fn patternByteAt(pos: usize) u8 {
+    return @intCast(pos % 256);
+}
 
 /// Send a fixed byte pattern with the low-level SCTP sender.
 fn runSender(io_inst: std.Io, sctp_port: u16, num_bytes: usize, udp_local: u16, udp_remote: u16) !void {
-    print("peer sender: acquireStack udp_local={d}\n", .{udp_local});
+    print(io_inst, "peer sender: acquireStack udp_local={d}\n", .{udp_local});
     try sctp.acquireStack(udp_local, io_inst);
-    defer sctp.releaseStack();
+    defer sctp.releaseStack(io_inst);
 
-    print("peer sender: SctpSender.init sctp_port={d} udp_remote={d}\n", .{ sctp_port, udp_remote });
+    print(io_inst, "peer sender: SctpSender.init sctp_port={d} udp_remote={d}\n", .{ sctp_port, udp_remote });
     var sender = sctp.SctpSender.init(
         SocketAddr.loopbackIp4(sctp_port),
         2,
@@ -104,34 +97,34 @@ fn runSender(io_inst: std.Io, sctp_port: u16, num_bytes: usize, udp_local: u16, 
         null,
         io_inst,
     ) catch |e| {
-        print("ERROR SctpSender.init: {t}\n", .{e});
+        print(io_inst, "ERROR SctpSender.init: {t}\n", .{e});
         std.process.exit(1);
     };
     defer sender.close();
 
-    print("peer sender: SctpSender.init returned, sending {d} bytes\n", .{num_bytes});
+    print(io_inst, "peer sender: SctpSender.init returned, sending {d} bytes\n", .{num_bytes});
     // Send num_bytes of a fixed pattern on stream 0.
     var buf: [4096]u8 = undefined;
     var sent: usize = 0;
     while (sent < num_bytes) {
         const chunk = @min(buf.len, num_bytes - sent);
-        for (0..chunk) |i| buf[i] = Pattern.byteAt(sent + i);
+        for (0..chunk) |i| buf[i] = patternByteAt(sent + i);
         sender.send(0, buf[0..chunk]) catch |e| {
-            print("ERROR send: {t}\n", .{e});
+            print(io_inst, "ERROR send: {t}\n", .{e});
             std.process.exit(1);
         };
         sent += chunk;
     }
-    print("OK SENT {d}\n", .{sent});
+    print(io_inst, "OK SENT {d}\n", .{sent});
 }
 
 /// Receive and verify a fixed byte pattern with the low-level SCTP receiver.
 fn runReceiver(io_inst: std.Io, sctp_port: u16, num_bytes: usize, udp_local: u16, udp_remote: u16) !void {
-    print("peer receiver: acquireStack udp_local={d}\n", .{udp_local});
+    print(io_inst, "peer receiver: acquireStack udp_local={d}\n", .{udp_local});
     try sctp.acquireStack(udp_local, io_inst);
-    defer sctp.releaseStack();
+    defer sctp.releaseStack(io_inst);
 
-    print("peer receiver: SctpReceiver.init sctp_port={d} udp_remote={d}\n", .{ sctp_port, udp_remote });
+    print(io_inst, "peer receiver: SctpReceiver.init sctp_port={d} udp_remote={d}\n", .{ sctp_port, udp_remote });
     var receiver = sctp.SctpReceiver.init(
         SocketAddr.loopbackIp4(sctp_port),
         2,
@@ -141,52 +134,60 @@ fn runReceiver(io_inst: std.Io, sctp_port: u16, num_bytes: usize, udp_local: u16
         },
         io_inst,
     ) catch |e| {
-        print("ERROR SctpReceiver.init: {t}\n", .{e});
+        print(io_inst, "ERROR SctpReceiver.init: {t}\n", .{e});
         std.process.exit(1);
     };
     defer receiver.close();
 
-    print("peer receiver: accept waiting\n", .{});
+    print(io_inst, "peer receiver: accept waiting\n", .{});
     receiver.accept(.{ .udp_encaps_port = udp_remote }) catch |e| {
-        print("ERROR accept: {t}\n", .{e});
+        print(io_inst, "ERROR accept: {t}\n", .{e});
         std.process.exit(1);
     };
-    print("peer receiver: accept returned\n", .{});
+    print(io_inst, "peer receiver: accept returned\n", .{});
 
     var buf: [4096]u8 = undefined;
     var got: usize = 0;
     while (got < num_bytes) {
         const r = receiver.recv(&buf) catch |e| {
-            print("ERROR recv: {t}\n", .{e});
+            print(io_inst, "ERROR recv: {t}\n", .{e});
             std.process.exit(1);
         };
         // Verify the received pattern.
         for (0..r.len) |i| {
-            const expected = Pattern.byteAt(got + i);
+            const expected = patternByteAt(got + i);
             if (buf[i] != expected) {
-                print("ERROR pattern mismatch at {d}: got {d}, expected {d}\n", .{ got + i, buf[i], expected });
+                print(io_inst, "ERROR pattern mismatch at {d}: got {d}, expected {d}\n", .{ got + i, buf[i], expected });
                 std.process.exit(1);
             }
         }
         got += r.len;
     }
-    print("OK RECV {d}\n", .{got});
+    print(io_inst, "OK RECV {d}\n", .{got});
 }
 
 /// Generate and send a sine wave with the high-level Writer.
-fn runWriter(io_inst: std.Io, sctp_port: u16, num_frames: usize, channels: u16, udp_local: u16, udp_remote: u16) !void {
+fn runWriter(
+    io_inst: std.Io,
+    allocator: std.mem.Allocator,
+    sctp_port: u16,
+    num_frames: usize,
+    channels: u16,
+    udp_local: u16,
+    udp_remote: u16,
+) !void {
     try sctp.acquireStack(udp_local, io_inst);
-    defer sctp.releaseStack();
+    defer sctp.releaseStack(io_inst);
 
     const channel_mask: i32 = switch (channels) {
         1 => 0x4, // Front center.
         2 => 0x3, // Front left and front right.
-        else => unreachable,
+        else => return error.UnsupportedChannels,
     };
 
-    const w = try alloc.create(Writer);
-    defer alloc.destroy(w);
-    w.lifecycle = .uninitialized;
+    const w = try allocator.create(Writer);
+    defer allocator.destroy(w);
+    w.initUninitialized();
 
     w.init(.{
         .wp = .{
@@ -200,7 +201,7 @@ fn runWriter(io_inst: std.Io, sctp_port: u16, num_frames: usize, channels: u16, 
             .udp_encaps_port = udp_remote,
         },
     }, SocketAddr.loopbackIp4(sctp_port), io_inst) catch |e| {
-        print("ERROR Writer.init failed: {t}\n", .{e});
+        print(io_inst, "ERROR Writer.init failed: {t}\n", .{e});
         std.process.exit(1);
     };
     defer w.deinit();
@@ -218,45 +219,51 @@ fn runWriter(io_inst: std.Io, sctp_port: u16, num_frames: usize, channels: u16, 
                 samples[i * channels + c] = val;
             }
         }
-        w.write(samples[0 .. n * channels]) catch fail("Writer.write failed");
+        w.write(samples[0 .. n * channels]) catch fail(io_inst, "Writer.write failed");
         sent += n;
     }
-    w.flush() catch fail("Writer.flush failed");
-    print("OK WROTE {d}\n", .{sent});
+    w.flush() catch fail(io_inst, "Writer.flush failed");
+    print(io_inst, "OK WROTE {d}\n", .{sent});
 }
 
 /// Receive and count sine-wave frames with the high-level Reader.
-fn runReader(io_inst: std.Io, sctp_port: u16, num_frames: usize, channels: u16, udp_local: u16, udp_remote: u16) !void {
+fn runReader(
+    io_inst: std.Io,
+    allocator: std.mem.Allocator,
+    sctp_port: u16,
+    num_frames: usize,
+    channels: u16,
+    udp_local: u16,
+    udp_remote: u16,
+) !void {
     try sctp.acquireStack(udp_local, io_inst);
-    defer sctp.releaseStack();
+    defer sctp.releaseStack(io_inst);
 
-    const r = try alloc.create(Reader);
-    defer alloc.destroy(r);
-    // SAFETY: r.init() overwrites every Reader field before any field is read.
-    r.* = undefined;
-    r.lifecycle = .uninitialized;
+    const r = try allocator.create(Reader);
+    defer allocator.destroy(r);
+    r.initUninitialized();
 
-    r.init(.{
+    r.init(allocator, .{
         .sctp = .{
             .nodelay = true,
             .udp_encaps_port = udp_remote,
         },
-    }, SocketAddr.loopbackIp4(sctp_port), io_inst) catch fail("Reader.init failed");
+    }, SocketAddr.loopbackIp4(sctp_port), io_inst) catch fail(io_inst, "Reader.init failed");
     defer r.deinit();
 
-    r.accept(.{ .sctp = .{ .udp_encaps_port = udp_remote } }) catch fail("accept failed");
-    const cfg = r.recvConfig() catch fail("recvConfig failed");
-    if (cfg.num_channels != channels) fail("channel count mismatch");
+    r.accept(.{ .sctp = .{ .udp_encaps_port = udp_remote } }) catch fail(io_inst, "accept failed");
+    const cfg = r.recvConfig() catch fail(io_inst, "recvConfig failed");
+    if (cfg.num_channels != channels) fail(io_inst, "channel count mismatch");
 
-    r.start(1) catch fail("start failed");
+    r.start(1) catch fail(io_inst, "start failed");
 
     var output: [8192 * 8]i32 = undefined;
     var got: usize = 0;
     while (got < num_frames) {
         const want = @min(output.len / channels, num_frames - got);
-        const n = r.readFrame(output[0 .. want * channels]) catch fail("readFrame failed");
-        if (n == 0) fail("readFrame returned 0");
+        const n = r.readFrame(output[0 .. want * channels]) catch fail(io_inst, "readFrame failed");
+        if (n == 0) fail(io_inst, "readFrame returned 0");
         got += n / channels;
     }
-    print("OK READ {d}\n", .{got});
+    print(io_inst, "OK READ {d}\n", .{got});
 }

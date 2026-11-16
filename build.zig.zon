@@ -1,6 +1,6 @@
 .{
     .name = .sctp_wps,
-    .version = "1.0.0",
+    .version = "1.1.0",
     .fingerprint = 0xb021882b0866cb29,
     .minimum_zig_version = "0.16.0",
     .paths = .{

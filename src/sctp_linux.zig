@@ -11,9 +11,10 @@ const posix = std.posix;
 const linux = std.os.linux;
 const SocketAddr = @import("sctp.zig").SocketAddr;
 const ConnectState = @import("connect_state.zig").ConnectState;
+const protocol_rules = @import("protocol.zig");
 
 /// IANA protocol number for SCTP (RFC 4960).
-pub const IPPROTO_SCTP: u32 = 132;
+pub const IPPROTO_SCTP: u32 = linux.IPPROTO.SCTP;
 
 // ---------------------------------------------------------------------------
 // Raw syscall helpers.
@@ -24,7 +25,7 @@ pub const IPPROTO_SCTP: u32 = 132;
 // ---------------------------------------------------------------------------
 
 fn sysSocket(domain: u32, sock_type: u32, protocol: u32) !posix.fd_t {
-    const rc = linux.socket(domain, sock_type, protocol);
+    const rc = linux.socket(domain, sock_type | linux.SOCK.CLOEXEC, protocol);
     return unwrapFd(rc, .{
         .ACCES = error.PermissionDenied,
         .ADDRINUSE = error.AddressInUse,
@@ -59,8 +60,7 @@ fn sysListen(fd: posix.fd_t, backlog: u32) !void {
 }
 
 fn sysConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
-    const rc = linux.connect(fd, addr, len);
-    try unwrapVoid(rc, .{
+    const map = .{
         .ACCES = error.PermissionDenied,
         .ADDRINUSE = error.AddressInUse,
         .ADDRNOTAVAIL = error.AddressNotAvailable,
@@ -74,12 +74,21 @@ fn sysConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t)
         .NOTSOCK = error.NotASocket,
         .PROTOTYPE = error.ProtocolNotSupported,
         .TIMEDOUT = error.TimedOut,
-    }, error.ConnectFailed);
+    };
+    while (true) {
+        const rc = linux.connect(fd, addr, len);
+        const signed: isize = @bitCast(rc);
+        if (signed == 0) return;
+        const err: linux.E = linux.errno(rc);
+        if (err == .INTR) continue;
+        if (err == .ISCONN) return;
+        if (ErrnoMap.get(map, err)) |e| return e;
+        return error.ConnectFailed;
+    }
 }
 
 fn sysAccept(fd: posix.fd_t, addr: ?*posix.sockaddr, len: ?*posix.socklen_t) !posix.fd_t {
-    const rc = linux.accept(fd, addr, len);
-    return unwrapFd(rc, .{
+    const map = .{
         .AGAIN = error.WouldBlock,
         .BADF = error.FileDescriptorInvalid,
         .CONNABORTED = error.ConnectionAborted,
@@ -90,7 +99,17 @@ fn sysAccept(fd: posix.fd_t, addr: ?*posix.sockaddr, len: ?*posix.socklen_t) !po
         .NOBUFS = error.SystemResources,
         .NOMEM = error.SystemResources,
         .OPNOTSUPP = error.OperationNotSupported,
-    }, error.AcceptFailed);
+    };
+    while (true) {
+        const rc = linux.accept4(fd, addr, len, linux.SOCK.CLOEXEC);
+        const signed: isize = @bitCast(rc);
+        if (signed >= 0) return @intCast(signed);
+        const err = linux.errno(rc);
+        // Retry a signal-interrupted accept instead of failing.
+        if (err == .INTR) continue;
+        if (ErrnoMap.get(map, err)) |e| return e;
+        return error.AcceptFailed;
+    }
 }
 
 fn sysShutdown(fd: posix.fd_t, how: i32) void {
@@ -134,10 +153,6 @@ const SCTP_NODELAY: u32 = 3; // Disable Nagle-style batching.
 const SCTP_INITMSG: u32 = 2; // Set stream counts for new associations.
 const SCTP_REMOTE_UDP_ENCAPS_PORT: u32 = 132; // RFC 6951 UDP port.
 
-// Standard socket option constants from linux/socket.h.
-const SOL_SOCKET: u32 = 1; // Generic socket option level.
-const SO_SNDBUF: u32 = 7; // Send buffer size in bytes.
-
 /// Mirror of struct sctp_initmsg.
 /// It requests inbound and outbound stream counts during the SCTP handshake.
 /// Set it with SCTP_INITMSG before connect() or listen().
@@ -163,7 +178,6 @@ const SctpSndRcvInfo = extern struct {
     sinfo_stream: u16,
     sinfo_ssn: u16,
     sinfo_flags: u16,
-    sinfo_pr_policy: u16,
     sinfo_ppid: u32,
     sinfo_context: u32,
     sinfo_timetolive: u32,
@@ -211,6 +225,53 @@ fn cmsgSpace(data_len: usize) usize {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// The kernel SCTP backend has no process-wide stack state.
+pub fn acquireStack(_: u16, _: std.Io) !void {}
+
+/// The kernel SCTP backend has no process-wide stack state.
+pub fn releaseStack(_: std.Io) void {}
+
+/// Cancel a blocking connect and close the descriptor claimed by the
+/// cancellation operation.
+pub fn cancelConnect(state: *ConnectState) void {
+    if (state.cancel()) |fd| sysClose(fd);
+}
+
+/// Request inbound and outbound stream counts before connect or listen.
+fn setInitMsg(fd: posix.fd_t, num_streams: u16) !void {
+    const initmsg = SctpInitMsg{
+        .sinit_num_ostreams = num_streams,
+        .sinit_max_instreams = num_streams,
+        .sinit_max_attempts = 0,
+        .sinit_max_init_timeo = 0,
+    };
+    try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, std.mem.asBytes(&initmsg));
+}
+
+/// Enable RFC 6951 SCTP-over-UDP encapsulation toward `port`.
+/// The wildcard address family must match the socket family.
+fn setUdpEncaps(fd: posix.fd_t, local: SocketAddr, port: u16) !void {
+    var encaps = std.mem.zeroes(SctpUdpEncaps);
+    const wildcard = switch (local.ip) {
+        .ip4 => SocketAddr.anyIp4(0),
+        .ip6 => SocketAddr.parseIp6(.{0} ** 16, 0, 0),
+    };
+    var encaps_addr_len: posix.socklen_t = 0;
+    wildcard.toSockaddr(&encaps.sue_address, &encaps_addr_len);
+    encaps.sue_assoc_id = 0;
+    encaps.sue_port = std.mem.nativeToBig(u16, port);
+    try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, std.mem.asBytes(&encaps));
+}
+
+/// Configure an accepted SCTP socket for stream-aware receives.
+fn configureAccepted(fd: posix.fd_t, cfg: SctpReceiver.Config) !void {
+    if (cfg.nodelay) {
+        try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_NODELAY, std.mem.asBytes(&@as(u32, 1)));
+    }
+    // Enable SCTP_RCVINFO in recvmsg ancillary data.
+    try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_RECVRCVINFO, std.mem.asBytes(&@as(u32, 1)));
+}
+
 /// SCTP sender for a one-to-one association.
 /// Call `init()` before sending data on a negotiated stream.
 pub const SctpSender = struct {
@@ -219,6 +280,10 @@ pub const SctpSender = struct {
     /// Io context retained for interface parity with the usrsctp backend.
     /// The Linux raw-syscall path does not use it.
     io: std.Io = std.Io.failing,
+    /// Destination uses IPv6.
+    ipv6: bool = false,
+    /// RFC 6951 UDP encapsulation is enabled for the association.
+    udp_encaps: bool = false,
 
     /// Linux SCTP sender options.
     pub const Config = struct {
@@ -247,39 +312,26 @@ pub const SctpSender = struct {
     /// Capture `io` for API parity with the usrsctp backend.
     /// The context must outlive the returned sender.
     pub fn init(dest: SocketAddr, num_streams: u16, cfg: Config, cancel_state: ?*ConnectState, io: std.Io) !SctpSender {
-        if (cancel_state) |state| state.begin();
+        if (cancel_state) |state| {
+            if (!state.begin()) return error.ConnectCanceled;
+        }
         const fd = try sysSocket(dest.family(), posix.SOCK.STREAM, IPPROTO_SCTP);
         var owns_fd = true;
         errdefer if (owns_fd) sysClose(fd);
 
         // Request the desired inbound and outbound stream counts.
-        const initmsg = SctpInitMsg{
-            .sinit_num_ostreams = num_streams,
-            .sinit_max_instreams = num_streams,
-            .sinit_max_attempts = 0,
-            .sinit_max_init_timeo = 0,
-        };
-        try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, std.mem.asBytes(&initmsg));
+        try setInitMsg(fd, num_streams);
 
         if (cfg.nodelay) {
             try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_NODELAY, std.mem.asBytes(&@as(u32, 1)));
         }
 
         if (cfg.sndbuf_size > 0) {
-            try posix.setsockopt(fd, SOL_SOCKET, SO_SNDBUF, std.mem.asBytes(&cfg.sndbuf_size));
+            try posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&cfg.sndbuf_size));
         }
 
         if (cfg.udp_encaps_port > 0) {
-            var encaps = std.mem.zeroes(SctpUdpEncaps);
-            const wildcard = switch (dest.ip) {
-                .ip4 => SocketAddr.anyIp4(0),
-                .ip6 => SocketAddr.parseIp6(.{0} ** 16, 0, 0),
-            };
-            var encaps_addr_len: posix.socklen_t = 0;
-            wildcard.toSockaddr(&encaps.sue_address, &encaps_addr_len);
-            encaps.sue_assoc_id = 0;
-            encaps.sue_port = std.mem.nativeToBig(u16, cfg.udp_encaps_port);
-            try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, std.mem.asBytes(&encaps));
+            try setUdpEncaps(fd, dest, cfg.udp_encaps_port);
         }
 
         // Publish the fd immediately before the only blocking operation.
@@ -317,6 +369,8 @@ pub const SctpSender = struct {
         return .{
             .fd = fd,
             .io = io,
+            .ipv6 = dest.family() == posix.AF.INET6,
+            .udp_encaps = cfg.udp_encaps_port > 0,
         };
     }
 
@@ -355,22 +409,26 @@ pub const SctpSender = struct {
             .flags = 0,
         };
 
-        const rc = linux.sendmsg(self.fd, &msg, linux.MSG.NOSIGNAL);
-        const signed: isize = @bitCast(rc);
-        if (signed < 0) {
-            const err: linux.E = linux.errno(rc);
-            return switch (err) {
-                .INVAL => error.InvalidArgument,
-                .AGAIN => error.WouldBlock,
-                .CONNRESET => error.ConnectionResetByPeer,
-                .PIPE => error.BrokenPipe,
-                .NOBUFS, .NOMEM => error.SystemResources,
-                .NETUNREACH, .HOSTUNREACH => error.NetworkUnreachable,
-                else => error.SendFailed,
-            };
+        while (true) {
+            const rc = linux.sendmsg(self.fd, &msg, linux.MSG.NOSIGNAL);
+            const signed: isize = @bitCast(rc);
+            if (signed < 0) {
+                const err: linux.E = linux.errno(rc);
+                if (err == .INTR) continue;
+                return switch (err) {
+                    .INVAL => error.InvalidArgument,
+                    .AGAIN => error.WouldBlock,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .PIPE => error.BrokenPipe,
+                    .NOBUFS, .NOMEM => error.SystemResources,
+                    .NETUNREACH, .HOSTUNREACH => error.NetworkUnreachable,
+                    else => error.SendFailed,
+                };
+            }
+            const sent: usize = @intCast(signed);
+            if (sent != data.len) return error.PartialSend;
+            return;
         }
-        const sent: usize = @intCast(signed);
-        if (sent != data.len) return error.PartialSend;
     }
 
     /// Wake a thread blocked in sendmsg() without releasing the descriptor.
@@ -378,49 +436,33 @@ pub const SctpSender = struct {
         if (self.fd != -1) sysShutdown(self.fd, 2); // SHUT_RDWR.
     }
 
-    /// Cancel a blocking connect and close the descriptor claimed by the
-    /// cancellation operation.
-    pub fn cancelConnect(state: *ConnectState) void {
-        if (state.cancel()) |fd| sysClose(fd);
-    }
-
-    /// Estimate the maximum WavPack block payload for the path.
+    /// Return the maximum WavPack block size for the path.
     ///
-    /// Use IP_MTU because SCTP path discovery may not be complete at connect.
-    /// The SCTP fragmentation point can be too large at that time.
+    /// The result already has WavPack's four-byte alignment and two-byte
+    /// margin applied. The writer must use it directly.
     ///
-    /// The IPv4 overhead estimate is 20 bytes for IP, 12 bytes for SCTP, and
-    /// 16 bytes for the DATA chunk. The total is 48 bytes.
+    /// The overhead is 20 bytes for IPv4 or 40 bytes for IPv6, 12 bytes for
+    /// SCTP, and 16 bytes for the DATA chunk. RFC 6951 UDP encapsulation adds
+    /// eight bytes. The MTU is capped at 1500 for Ethernet-like latency.
     ///
-    /// Cap the effective MTU at 1500 bytes. This prevents large loopback MTUs
-    /// from producing high-latency blocks and keeps tests near Ethernet paths.
-    ///
-    /// Align the result down to four bytes and subtract two for WavPack
-    /// alignment. Return 1200 when the MTU query fails.
-    pub fn maxSegSize(self: *const SctpSender) u32 {
+    /// Return 1200 when the MTU query fails.
+    pub fn maxBlockBytes(self: *const SctpSender) u32 {
         if (self.fd == -1) return 1200;
-        // IP_MTU gives the route MTU without waiting for SCTP path discovery.
-        const IPPROTO_IP: u32 = 0;
-        const IP_MTU: u32 = 14;
+        const level: i32 = if (self.ipv6) linux.IPPROTO.IPV6 else linux.IPPROTO.IP;
+        const optname: u32 = if (self.ipv6) linux.IPV6.MTU else linux.IP.MTU;
         var mtu: i32 = 0;
         var optlen: posix.socklen_t = @sizeOf(i32);
-        const rc = linux.syscall5(
-            .getsockopt,
-            @as(usize, @intCast(self.fd)),
-            @as(usize, IPPROTO_IP),
-            @as(usize, IP_MTU),
-            @intFromPtr(&mtu),
-            @intFromPtr(&optlen),
-        );
+        const rc = linux.getsockopt(self.fd, level, optname, @ptrCast(&mtu), &optlen);
         const signed: isize = @bitCast(rc);
-        // Subtract the IPv4, SCTP, and DATA chunk headers.
-        const overhead: i32 = 48;
+
+        var overhead: i32 = if (self.ipv6) 68 else 48;
+        if (self.udp_encaps) overhead += 8;
         if (signed != 0 or mtu <= overhead) return 1200;
-        // Cap loopback's large MTU at an Ethernet-like value.
+
         const effective_mtu: i32 = @min(mtu, 1500);
+        if (effective_mtu <= overhead + 2) return 1200;
         const payload: u32 = @intCast(effective_mtu - overhead);
-        // Match WavPack's alignment requirement.
-        return (payload & ~@as(u32, 3)) -| 2;
+        return protocol_rules.blockBytesForPayload(payload);
     }
 
     /// Close the sender socket.
@@ -432,7 +474,6 @@ pub const SctpSender = struct {
 };
 
 // SCTP socket options for the receiver.
-const SO_RCVBUF: u32 = 8; // Receive buffer size.
 const SCTP_RECVRCVINFO: u32 = 32; // Enable SCTP_RCVINFO on recvmsg.
 const SCTP_RCVINFO: c_int = 3; // cmsg type containing the stream ID.
 const MSG_NOTIFICATION: c_int = 0x8000;
@@ -443,7 +484,6 @@ const SctpRcvInfo = extern struct {
     rcv_sid: u16, // Stream ID for this message.
     rcv_ssn: u16,
     rcv_flags: u16,
-    _pad: u16,
     rcv_ppid: u32,
     rcv_tsn: u32,
     rcv_cumtsn: u32,
@@ -499,31 +539,16 @@ pub const SctpReceiver = struct {
         errdefer sysClose(fd);
 
         // Allow immediate address reuse after a restart.
-        try posix.setsockopt(fd, SOL_SOCKET, 2, std.mem.asBytes(&@as(u32, 1))); // Enable SO_REUSEADDR.
+        try posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&@as(u32, 1))); // Enable SO_REUSEADDR.
 
-        const initmsg = SctpInitMsg{
-            .sinit_num_ostreams = num_streams,
-            .sinit_max_instreams = num_streams,
-            .sinit_max_attempts = 0,
-            .sinit_max_init_timeo = 0,
-        };
-        try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, std.mem.asBytes(&initmsg));
+        try setInitMsg(fd, num_streams);
 
         if (cfg.rcvbuf_size > 0) {
-            try posix.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, std.mem.asBytes(&cfg.rcvbuf_size));
+            try posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVBUF, std.mem.asBytes(&cfg.rcvbuf_size));
         }
 
         if (cfg.udp_encaps_port > 0) {
-            var encaps = std.mem.zeroes(SctpUdpEncaps);
-            const wildcard = switch (bind_addr.ip) {
-                .ip4 => SocketAddr.anyIp4(0),
-                .ip6 => SocketAddr.parseIp6(.{0} ** 16, 0, 0),
-            };
-            var encaps_addr_len: posix.socklen_t = 0;
-            wildcard.toSockaddr(&encaps.sue_address, &encaps_addr_len);
-            encaps.sue_assoc_id = 0;
-            encaps.sue_port = std.mem.nativeToBig(u16, cfg.udp_encaps_port);
-            try posix.setsockopt(fd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, std.mem.asBytes(&encaps));
+            try setUdpEncaps(fd, bind_addr, cfg.udp_encaps_port);
         }
 
         // SAFETY: toSockaddr() fills sa before bind reads it.
@@ -560,13 +585,7 @@ pub const SctpReceiver = struct {
         var addrlen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         const conn = sysAccept(self.listen_fd, @ptrCast(&addr), &addrlen) catch return false;
 
-        if (cfg.nodelay) {
-            posix.setsockopt(conn, IPPROTO_SCTP, SCTP_NODELAY, std.mem.asBytes(&@as(u32, 1))) catch {
-                sysClose(conn);
-                return false;
-            };
-        }
-        posix.setsockopt(conn, IPPROTO_SCTP, SCTP_RECVRCVINFO, std.mem.asBytes(&@as(u32, 1))) catch {
+        configureAccepted(conn, cfg) catch {
             sysClose(conn);
             return false;
         };
@@ -617,6 +636,7 @@ pub const SctpReceiver = struct {
 
     /// Accept one incoming SCTP association and block until it connects.
     /// Configure SCTP_NODELAY and enable SCTP_RCVINFO for stream IDs.
+    /// Listener address and UDP encapsulation are set by init().
     pub fn accept(self: *SctpReceiver, cfg: Config) !void {
         if (self.conn_fd != -1 or self.pending_fd != -1) return error.InvalidState;
         // SAFETY: sysAccept fills addr before any field is read.
@@ -625,12 +645,7 @@ pub const SctpReceiver = struct {
         const conn = try sysAccept(self.listen_fd, @ptrCast(&addr), &addrlen);
         errdefer sysClose(conn);
 
-        if (cfg.nodelay) {
-            try posix.setsockopt(conn, IPPROTO_SCTP, SCTP_NODELAY, std.mem.asBytes(&@as(u32, 1)));
-        }
-
-        // Enable SCTP_RCVINFO in recvmsg ancillary data.
-        try posix.setsockopt(conn, IPPROTO_SCTP, SCTP_RECVRCVINFO, std.mem.asBytes(&@as(u32, 1)));
+        try configureAccepted(conn, cfg);
 
         self.conn_fd = conn;
         self.peer_addr = SocketAddr.fromSockaddr(&addr, addrlen) catch null;
@@ -666,7 +681,14 @@ pub const SctpReceiver = struct {
             .flags = 0,
         };
 
-        const rc = linux.recvmsg(self.conn_fd, &msg, 0);
+        const rc: usize = while (true) {
+            msg.controllen = cmsg_space_val;
+            msg.flags = 0;
+            const result = linux.recvmsg(self.conn_fd, &msg, 0);
+            const result_signed: isize = @bitCast(result);
+            if (result_signed < 0 and linux.errno(result) == .INTR) continue;
+            break result;
+        };
         const signed: isize = @bitCast(rc);
         if (signed <= 0) {
             if (signed == 0) return error.ConnectionClosed;
@@ -682,23 +704,29 @@ pub const SctpReceiver = struct {
             return error.InvalidMessage;
         }
 
-        // Parse SCTP_RCVINFO to obtain the stream ID.
+        // Parse SCTP_RCVINFO to obtain the stream ID. Walk the complete cmsg
+        // chain because the kernel may attach more than one control message.
         var stream_id: u16 = 0;
+        var found_stream = false;
         if (msg.controllen >= @sizeOf(cmsghdr)) {
-            const cmsg: *cmsghdr = @ptrCast(@alignCast(@as([*]u8, @ptrCast(msg.control))));
-            if (cmsg.level == IPPROTO_SCTP and
-                cmsg.type == SCTP_RCVINFO and
-                cmsg.len >= cmsgLen(@sizeOf(SctpRcvInfo)) and
-                cmsg.len <= msg.controllen)
-            {
-                const info: *const SctpRcvInfo = @ptrCast(@alignCast(cmsg.data()));
-                stream_id = info.rcv_sid;
-            } else {
-                return error.MissingStreamInfo;
+            const control: [*]u8 = @ptrCast(msg.control);
+            var offset: usize = 0;
+            while (offset + @sizeOf(cmsghdr) <= msg.controllen) {
+                const cmsg: *cmsghdr = @ptrCast(@alignCast(control + offset));
+                if (cmsg.len < @sizeOf(cmsghdr) or cmsg.len > msg.controllen - offset) break;
+                if (cmsg.level == IPPROTO_SCTP and
+                    cmsg.type == SCTP_RCVINFO and
+                    cmsg.len >= cmsgLen(@sizeOf(SctpRcvInfo)))
+                {
+                    const info: *const SctpRcvInfo = @ptrCast(@alignCast(cmsg.data()));
+                    stream_id = info.rcv_sid;
+                    found_stream = true;
+                    break;
+                }
+                offset += cmsgAlign(cmsg.len);
             }
-        } else {
-            return error.MissingStreamInfo;
         }
+        if (!found_stream) return error.MissingStreamInfo;
 
         return .{
             .stream_id = stream_id,
@@ -730,6 +758,14 @@ pub const SctpReceiver = struct {
         self.pending_peer_addr = null;
     }
 };
+
+comptime {
+    // The syscall marshalling code relies on these kernel ABI sizes.
+    std.debug.assert(@sizeOf(SctpSndRcvInfo) == 32);
+    std.debug.assert(@sizeOf(SctpRcvInfo) == 28);
+    std.debug.assert(@sizeOf(SctpUdpEncaps) == 144);
+    std.debug.assert(@sizeOf(SctpInitMsg) == 8);
+}
 
 // Linux backend tests.
 /// Skip the test when the kernel cannot create an SCTP socket.
@@ -863,7 +899,7 @@ test "cancel unblocks accept" {
         .{},
         std.testing.io,
     );
-    // cancel() closes the file descriptors.
+    // cancel() shuts down the descriptors to wake accept().
 
     const at = try std.Thread.spawn(.{}, struct {
         fn run(recv: *SctpReceiver) void {
@@ -878,7 +914,7 @@ test "cancel unblocks accept" {
     receiver.close();
 }
 
-test "SctpSender maxSegSize respects 1500 MTU cap on loopback" {
+test "SctpSender maxBlockBytes respects 1500 MTU cap on loopback" {
     try requireSctp();
 
     // Start a receiver so the sender has a peer to connect to.
@@ -907,14 +943,14 @@ test "SctpSender maxSegSize respects 1500 MTU cap on loopback" {
     defer sender.close();
     at.join();
 
-    const mss = sender.maxSegSize();
+    const block_bytes = sender.maxBlockBytes();
     // The effective loopback MTU must use the 1500-byte cap.
     // The resulting payload is at most 1450 bytes after overhead and alignment.
-    try std.testing.expect(mss <= 1450);
-    try std.testing.expect(mss >= 1200); // The fallback value is 1200.
+    try std.testing.expect(block_bytes <= 1450);
+    try std.testing.expect(block_bytes >= 1200); // The fallback value is 1200.
 }
 
-test "SctpSender maxSegSize stays within path bounds" {
+test "SctpSender maxBlockBytes stays within path bounds" {
     try requireSctp();
 
     // A live socket cannot reliably force the IP_MTU fallback.
@@ -946,9 +982,9 @@ test "SctpSender maxSegSize stays within path bounds" {
 
     // The normal result is bounded by the effective payload cap.
     // The fallback result is 1200.
-    const mss = sender.maxSegSize();
-    try std.testing.expect(mss >= 1200);
-    try std.testing.expect(mss <= 1500 - 48);
+    const block_bytes = sender.maxBlockBytes();
+    try std.testing.expect(block_bytes >= 1200);
+    try std.testing.expect(block_bytes <= 1500 - 48);
 }
 
 test "SctpReceiver recv extracts stream_id using SCTP_RCVINFO cmsg" {

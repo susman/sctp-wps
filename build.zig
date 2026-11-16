@@ -4,7 +4,6 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const strip = optimize != .Debug;
 
     const host_os = b.graph.host.result.os.tag;
     const target_os = target.result.os.tag;
@@ -26,13 +25,12 @@ pub fn build(b: *std.Build) void {
         false;
 
     if (macos_universal) {
-        buildMacosUniversal(b, optimize, strip, host_os);
+        buildMacosUniversal(b, optimize, host_os);
     } else {
-        const lib_mod = b.createModule(.{
+        const lib_mod = b.addModule("sctp-wps", .{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = strip,
             .link_libc = true,
         });
         addWavpackStream(b, lib_mod, have_system_wp, target, optimize);
@@ -46,7 +44,7 @@ pub fn build(b: *std.Build) void {
         b.installFile("include/sctp-wps.h", "include/sctp-wps.h");
     }
 
-    setupTests(b, target, optimize, strip, have_system_wp, host_os);
+    setupTests(b, target, optimize, have_system_wp, host_os);
 }
 
 /// Configure the test module and the peer helper executable.
@@ -54,7 +52,6 @@ fn setupTests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    strip: bool,
     have_system_wp: bool,
     host_os: std.Target.Os.Tag,
 ) void {
@@ -62,7 +59,6 @@ fn setupTests(
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = strip,
         .link_libc = true,
     });
     addWavpackStream(b, test_mod, have_system_wp, target, optimize);
@@ -74,7 +70,6 @@ fn setupTests(
         .root_source_file = b.path("src/peer.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = strip,
         .link_libc = true,
     });
     addWavpackStream(b, peer_mod, have_system_wp, target, optimize);
@@ -84,7 +79,6 @@ fn setupTests(
         .name = "sctp-wps-peer",
         .root_module = peer_mod,
     });
-    const peer_install = b.addInstallArtifact(peer_exe, .{});
 
     const test_options = b.addOptions();
     test_options.addOptionPath("peer_path", peer_exe.getEmittedBin());
@@ -95,7 +89,7 @@ fn setupTests(
     });
 
     const run_tests = b.addRunArtifact(tests);
-    run_tests.step.dependOn(&peer_install.step);
+    run_tests.step.dependOn(&peer_exe.step);
     const test_step = b.step("test", "Run unit and network tests");
     test_step.dependOn(&run_tests.step);
 }
@@ -106,11 +100,10 @@ fn setupTests(
 fn buildMacosUniversal(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
-    strip: bool,
     host_os: std.Target.Os.Tag,
 ) void {
-    const x64_lib = buildMacosLib(b, optimize, strip, .x86_64, host_os);
-    const arm64_lib = buildMacosLib(b, optimize, strip, .aarch64, host_os);
+    const x64_lib = buildMacosLib(b, optimize, .x86_64, host_os);
+    const arm64_lib = buildMacosLib(b, optimize, .aarch64, host_os);
 
     const lipo_exe: []const u8 = if (host_os == .macos)
         "lipo"
@@ -142,7 +135,6 @@ fn buildMacosUniversal(
 fn buildMacosLib(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
-    strip: bool,
     arch: std.Target.Cpu.Arch,
     host_os: std.Target.Os.Tag,
 ) *std.Build.Step.Compile {
@@ -154,7 +146,6 @@ fn buildMacosLib(
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = strip,
         .link_libc = true,
     });
     addWavpackStream(b, mod, false, target, optimize);

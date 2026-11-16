@@ -8,6 +8,15 @@
  * against accidental corruption but do not authenticate peers or encrypt
  * audio. Applications that need hostile-network protection must add an
  * authenticated encrypted transport or restrict access at the network layer.
+ *
+ * Thread safety:
+ * - Lifecycle calls on one handle must be serialized by the caller.
+ * - swps_writer_cancel_connect() and swps_reader_cancel() are intended to be
+ *   called from another thread while a blocking call is in progress.
+ * - swps_writer_check() is safe while the handle is initialized and is not
+ *   being destroyed.
+ * - swps_writer_write() and swps_writer_try_write() require one producer.
+ * - swps_reader_read_frame() requires one consumer.
  */
 #ifndef SCTP_WPS_H
 #define SCTP_WPS_H
@@ -67,8 +76,7 @@ typedef struct {
  * udp_encaps_port selects the remote RFC 6951 UDP port on Linux.
  * Zero disables UDP encapsulation on Linux. The usrsctp sender uses 9899 when
  * this field is zero.
- * sndbuf_size sets SO_SNDBUF on Linux. Zero selects the system default.
- * The usrsctp backend currently ignores sndbuf_size.
+ * sndbuf_size sets SO_SNDBUF. Zero selects the system default.
  */
 typedef struct {
     uint8_t  nodelay;
@@ -82,6 +90,9 @@ swps_wp_config_t swps_wp_config_default(void);
 
 /* Return the default SCTP sender configuration. */
 swps_sctp_config_t swps_sctp_config_default(void);
+
+/* The writer PCM ring is fixed at 8 slots of 16384 int32_t values.
+ * swps_writer_write() and swps_writer_try_write() reject larger chunks. */
 
 /* Allocate an uninitialized writer handle. Return NULL on allocation failure.
  * swps_writer_destroy() is safe before a successful init. */
@@ -110,12 +121,22 @@ int swps_writer_init(swps_writer_t *w,
 /* Queue interleaved signed PCM values widened to int32_t.
  *
  * num_i32 is the total number of int32_t values. It is not a frame count.
- * It must be a multiple of the configured channel count.
+ * It must be a multiple of the configured channel count and at most 16384.
  * samples is copied before this function returns and is not modified.
- * The call can block when the internal queue is full.
+ * The call can block when the PCM ring is full.
  * Return 0 on success and -1 on failure.
  */
-int swps_writer_write(swps_writer_t *w, int32_t *samples, uint32_t num_i32);
+int swps_writer_write(swps_writer_t *w, const int32_t *samples, uint32_t num_i32);
+
+/* Queue interleaved signed PCM values without blocking.
+ *
+ * num_i32 is the total number of int32_t values. It is not a frame count.
+ * It must be a multiple of the configured channel count and at most 16384.
+ * samples is copied before this function returns and is not modified.
+ * Safe for a real-time thread. Return 0 on success and -1 when the PCM ring
+ * is full, a background error exists, or the writer is not initialized.
+ */
+int swps_writer_try_write(swps_writer_t *w, const int32_t *samples, uint32_t num_i32);
 
 /* Flush all samples already queued by the caller.
  *
@@ -128,6 +149,8 @@ int swps_writer_flush(swps_writer_t *w);
  *
  * This function does not block on pipeline work. Return 0 when no error has
  * been recorded and -1 when a background error has been recorded.
+ * Safe from another thread while the writer is initialized and is not being
+ * destroyed.
  */
 int swps_writer_check(swps_writer_t *w);
 
@@ -172,8 +195,7 @@ typedef struct swps_reader swps_reader_t;
  * udp_encaps_port is the remote peer's RFC 6951 UDP encapsulation port when
  * nonzero. Zero disables the per-peer setting on Linux. The usrsctp local
  * UDP port is selected by swps_stack_acquire(); this field selects the peer.
- * rcvbuf_size sets SO_RCVBUF on Linux. Zero selects the system default.
- * The usrsctp backend currently ignores rcvbuf_size.
+ * rcvbuf_size sets SO_RCVBUF. Zero selects the system default.
  */
 typedef struct {
     uint8_t  nodelay;
@@ -218,8 +240,10 @@ int swps_reader_init(swps_reader_t *r,
 
 /* Accept one incoming writer association.
  *
- * Block until a writer connects. The supplied configuration applies to the
- * accepted association. This call does not start the receive thread.
+ * Block until a writer connects. The listener address, UDP encapsulation
+ * port, and receive buffer are configured by swps_reader_init(). The
+ * configuration passed here applies association-specific options, currently
+ * nodelay. This call does not start the receive thread.
  * Call swps_reader_recv_config() next.
  * Return 0 on success and -1 on failure.
  */
@@ -237,7 +261,12 @@ int swps_reader_recv_config(swps_reader_t *r, swps_stream_config_t *out);
  *
  * buffer_blocks is the receive queue capacity in WavPack-stream blocks.
  * It must be between 1 and 65536. The decode thread pre-fills this queue before
- * the first read_frame call returns.
+ * the first read_frame call returns. A short stream must either close the
+ * association or send at least buffer_blocks blocks to reach the pre-fill
+ * depth.
+ * Memory cost scales with buffer_blocks: each queued block occupies about
+ * 2 KiB, so 65536 allocates roughly 128 MiB. Size it from the expected
+ * network jitter.
  * Return 0 on success and -1 on failure.
  */
 int swps_reader_start(swps_reader_t *r, uint32_t buffer_blocks);
@@ -248,6 +277,8 @@ int swps_reader_start(swps_reader_t *r, uint32_t buffer_blocks);
  * Write interleaved signed int32_t values into out_buf.
  * out_buf_cap is the number of int32_t slots in out_buf.
  * On success, write the number of values produced to *out_len.
+ * When the buffer is too small, the frame is retained and *out_len receives
+ * the required value count. Call again with a larger buffer.
  * Return 0 on success and -1 on failure.
  */
 int swps_reader_read_frame(swps_reader_t *r,
@@ -274,7 +305,11 @@ int swps_reader_next_session(swps_reader_t *r, swps_stream_config_t *out);
 void swps_reader_destroy(swps_reader_t *r);
 
 /* Request shutdown of blocked reader operations. The destroy function joins
- * all reader threads and releases the resources. */
+ * all reader threads and releases the resources.
+ *
+ * On Linux, shutdown wakes accept() and recv(). The usrsctp backend cannot
+ * reliably wake a thread blocked in accept(), so do not call destroy while
+ * another thread is blocked in accept() or next_session() on macOS. */
 void swps_reader_cancel(swps_reader_t *r);
 
 #ifdef __cplusplus

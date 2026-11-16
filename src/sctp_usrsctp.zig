@@ -20,6 +20,7 @@ const std = @import("std");
 const posix = std.posix;
 const SocketAddr = @import("sctp.zig").SocketAddr;
 const ConnectState = @import("connect_state.zig").ConnectState;
+const protocol = @import("protocol.zig");
 
 const c = @import("usrsctp_c");
 
@@ -41,32 +42,15 @@ fn sa(ptr: anytype) [*c]c.struct_sockaddr {
 var g_stack_mutex: std.Io.Mutex = .init;
 var g_stack_refcount: u32 = 0;
 var g_stack_port: u16 = 0;
-/// Io context captured by the first acquireStack() call.
-/// Later releases reuse this context because releaseStack() has no Io argument.
-var g_stack_io: std.Io = std.Io.failing;
-
+var g_stack_initialized: bool = false;
 /// Acquire a reference to the usrsctp stack.
 /// The first call initializes it with `local_port`. Zero selects port 9899.
-/// Pair each successful call with releaseStack().
+/// Pair each successful call with releaseStack(io).
 /// `io` backs the stack mutex operations.
 pub fn acquireStack(local_port: u16, io: std.Io) !void {
-    try initStack(local_port, io);
-}
-
-/// Release one reference to the usrsctp stack.
-/// Tear down the singleton when the last reference is released.
-/// The first acquired Io context remains in use for locking.
-pub fn releaseStack() void {
-    deinitStack();
-}
-
-/// Initialize the singleton or increment its reference count.
-/// The first call opens the UDP socket and starts usrsctp processing.
-/// It also enables blackhole mode and CRC32 checks on loopback.
-fn initStack(local_port: u16, io: std.Io) !void {
     g_stack_mutex.lockUncancelable(io);
     defer g_stack_mutex.unlock(io);
-    if (g_stack_refcount == 0) {
+    if (g_stack_refcount == 0 and !g_stack_initialized) {
         const port: u16 = if (local_port != 0) local_port else 9899;
         c.usrsctp_init(port, null, null);
         // Drop packets for unknown associations without sending ABORT.
@@ -74,31 +58,98 @@ fn initStack(local_port: u16, io: std.Io) !void {
         // Verify the SCTP CRC32 path on loopback as on a real network.
         _ = c.usrsctp_sysctl_set_sctp_no_csum_on_loopback(0);
         g_stack_port = port;
-        g_stack_io = io;
+        g_stack_initialized = true;
     } else if (local_port != 0 and local_port != g_stack_port) {
         return error.PortMismatch;
     }
     g_stack_refcount += 1;
 }
 
-/// Decrement the reference count and finish usrsctp at zero.
+/// usrsctp has no cancellable descriptor for connect.
+pub fn cancelConnect(_: *ConnectState) void {}
+
+/// Request inbound and outbound stream counts before connect or listen.
+fn setInitMsg(sock: *c.struct_socket, num_streams: u16) !void {
+    var initmsg = std.mem.zeroes(c.sctp_initmsg);
+    initmsg.sinit_num_ostreams = num_streams;
+    initmsg.sinit_max_instreams = num_streams;
+    if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_INITMSG, &initmsg, @sizeOf(c.sctp_initmsg)) != 0) {
+        std.log.err("SCTP_INITMSG failed errno={d}", .{std.c._errno().*});
+        return error.SetSockOptFailed;
+    }
+}
+
+/// Disable Nagle-style batching.
+fn setNodelay(sock: *c.struct_socket) !void {
+    const one: u32 = 1;
+    if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_NODELAY, &one, @sizeOf(@TypeOf(one))) != 0) {
+        std.log.err("SCTP_NODELAY failed errno={d}", .{std.c._errno().*});
+        return error.SetSockOptFailed;
+    }
+}
+
+/// Configure the remote UDP port for SCTP-over-UDP encapsulation.
+/// `port` is in host byte order. The wildcard address family must match the
+/// socket family. usrsctp requires the full sockaddr in sue_address.
+fn setUdpEncaps(sock: *c.struct_socket, family: u16, port: u16) !void {
+    var encaps = std.mem.zeroes(c.sctp_udpencaps);
+    // Use a wildcard address for the future association. The destination
+    // address is supplied separately to connect().
+    // Zero the unused bytes so no undefined data reaches the C structure.
+    var enc_sa: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var enc_sa_len: posix.socklen_t = 0;
+    const wildcard: SocketAddr = switch (family) {
+        posix.AF.INET6 => SocketAddr.parseIp6(.{0} ** 16, 0, 0),
+        else => SocketAddr.anyIp4(0),
+    };
+    wildcard.toSockaddr(&enc_sa, &enc_sa_len);
+    const ss_size = @min(@sizeOf(posix.sockaddr.storage), @sizeOf(@TypeOf(encaps.sue_address)));
+    @memcpy(
+        @as([*]u8, @ptrCast(&encaps.sue_address))[0..ss_size],
+        @as([*]const u8, @ptrCast(&enc_sa))[0..ss_size],
+    );
+    encaps.sue_assoc_id = 0;
+    encaps.sue_port = std.mem.nativeToBig(u16, port);
+    if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_REMOTE_UDP_ENCAPS_PORT, &encaps, @sizeOf(c.sctp_udpencaps)) != 0) {
+        std.log.err("SCTP_REMOTE_UDP_ENCAPS_PORT failed errno={d}", .{std.c._errno().*});
+        return error.SetSockOptFailed;
+    }
+}
+
+/// Configure an accepted connection socket for stream-aware receives.
+fn configureAccepted(sock: *c.struct_socket, cfg: SctpReceiver.Config) !void {
+    if (cfg.nodelay) try setNodelay(sock);
+    const rcvinfo_on: c_int = 1;
+    if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_RECVRCVINFO, &rcvinfo_on, @sizeOf(c_int)) != 0) {
+        std.log.err("SCTP_RECVRCVINFO failed errno={d}", .{std.c._errno().*});
+        return error.SetSockOptFailed;
+    }
+}
+
+/// Release one reference to the usrsctp stack.
+/// Tear down the singleton when the last reference is released.
 /// `usrsctp_finish()` can report active associations. Retry with a short
 /// delay until shutdown completes or the retry limit is reached.
-fn deinitStack() void {
-    const io = g_stack_io;
+pub fn releaseStack(io: std.Io) void {
     g_stack_mutex.lockUncancelable(io);
     defer g_stack_mutex.unlock(io);
     if (g_stack_refcount == 0) return;
     g_stack_refcount -= 1;
-    if (g_stack_refcount == 0) {
-        // Retry for about five seconds. Use the captured Io context for sleep.
-        var tries: u32 = 0;
-        while (tries < 50) : (tries += 1) {
-            if (c.usrsctp_finish() == 0) break;
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch |e|
-                std.log.warn("usrsctp_finish sleep failed: {}", .{e});
+    if (g_stack_refcount != 0) return;
+
+    // Retry for about five seconds. Keep g_stack_initialized set when the
+    // stack cannot shut down so a later acquire does not initialize it again.
+    var tries: u32 = 0;
+    while (tries < 50) : (tries += 1) {
+        if (c.usrsctp_finish() == 0) {
+            g_stack_initialized = false;
+            g_stack_port = 0;
+            return;
         }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch |e|
+            std.log.warn("usrsctp_finish sleep failed: {t}", .{e});
     }
+    std.log.err("usrsctp_finish did not complete, keeping the stack initialized", .{});
 }
 
 // Public transport API.
@@ -118,12 +169,16 @@ pub const SctpSender = struct {
     /// Io context captured at initialization.
     /// The stack uses it when the sender closes.
     io: std.Io = std.Io.failing,
+    /// Destination uses IPv6.
+    ipv6: bool = false,
+    /// RFC 6951 UDP encapsulation is enabled for the association.
+    udp_encaps: bool = false,
 
     /// usrsctp sender options.
     pub const Config = struct {
         /// Disable Nagle-style batching when true.
         nodelay: bool = true,
-        /// Reserved for backend parity. The current backend ignores this field.
+        /// SO_SNDBUF size in bytes. Zero selects the system default.
         sndbuf_size: u32 = 0,
         /// Remote RFC 6951 UDP port. Zero selects the default port 9899.
         udp_encaps_port: u16 = 0,
@@ -135,8 +190,8 @@ pub const SctpSender = struct {
     /// The Io context must outlive the returned sender.
     pub fn init(dest: SocketAddr, num_streams: u16, cfg: Config, cancel_state: ?*ConnectState, io: std.Io) !SctpSender {
         _ = cancel_state;
-        try initStack(0, io);
-        errdefer deinitStack();
+        try acquireStack(0, io);
+        errdefer releaseStack(io);
 
         const sock = c.usrsctp_socket(
             @intCast(dest.family()),
@@ -152,18 +207,13 @@ pub const SctpSender = struct {
         };
         errdefer c.usrsctp_close(sock);
 
-        var initmsg = std.mem.zeroes(c.sctp_initmsg);
-        initmsg.sinit_num_ostreams = num_streams;
-        initmsg.sinit_max_instreams = num_streams;
-        if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_INITMSG, &initmsg, @sizeOf(c.sctp_initmsg)) != 0) {
-            std.log.err("SCTP_INITMSG failed errno={d}", .{std.c._errno().*});
-            return error.SetSockOptFailed;
-        }
+        try setInitMsg(sock, num_streams);
 
-        if (cfg.nodelay) {
-            const one: u32 = 1;
-            if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_NODELAY, &one, @sizeOf(u32)) != 0) {
-                std.log.err("SCTP_NODELAY failed errno={d}", .{std.c._errno().*});
+        if (cfg.nodelay) try setNodelay(sock);
+
+        if (cfg.sndbuf_size > 0) {
+            if (c.usrsctp_setsockopt(sock, c.SOL_SOCKET, c.SO_SNDBUF, &cfg.sndbuf_size, @sizeOf(u32)) != 0) {
+                std.log.err("SO_SNDBUF failed errno={d}", .{std.c._errno().*});
                 return error.SetSockOptFailed;
             }
         }
@@ -187,27 +237,7 @@ pub const SctpSender = struct {
         // Configure the remote UDP port and SCTP-level destination address.
         // RFC 6951 requires both fields for association-scoped encapsulation.
         const udp_port: u16 = if (cfg.udp_encaps_port > 0) cfg.udp_encaps_port else 9899;
-        var encaps = std.mem.zeroes(c.sctp_udpencaps);
-        // Use a wildcard address for the future association. The destination
-        // address is supplied separately to connect().
-        // Zero the unused bytes so no undefined data reaches the C structure.
-        var enc_sa: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-        var enc_sa_len: posix.socklen_t = 0;
-        const wildcard = switch (dest.ip) {
-            .ip4 => SocketAddr.anyIp4(0),
-            .ip6 => SocketAddr.parseIp6(.{0} ** 16, 0, 0),
-        };
-        wildcard.toSockaddr(&enc_sa, &enc_sa_len);
-        const ss_size = @min(@sizeOf(posix.sockaddr.storage), @sizeOf(@TypeOf(encaps.sue_address)));
-        @memcpy(
-            @as([*]u8, @ptrCast(&encaps.sue_address))[0..ss_size],
-            @as([*]const u8, @ptrCast(&enc_sa))[0..ss_size],
-        );
-        encaps.sue_port = std.mem.nativeToBig(u16, udp_port);
-        if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_REMOTE_UDP_ENCAPS_PORT, &encaps, @sizeOf(c.sctp_udpencaps)) != 0) {
-            std.log.err("SCTP_REMOTE_UDP_ENCAPS_PORT failed errno={d}", .{std.c._errno().*});
-            return error.SetSockOptFailed;
-        }
+        try setUdpEncaps(sock, dest.family(), udp_port);
 
         // SAFETY: toSockaddr() fills dest_sa before connect reads it.
         var dest_sa: posix.sockaddr.storage = undefined;
@@ -218,7 +248,12 @@ pub const SctpSender = struct {
             return error.ConnectFailed;
         }
 
-        return .{ .sock = sock, .io = io };
+        return .{
+            .sock = sock,
+            .io = io,
+            .ipv6 = dest.family() == posix.AF.INET6,
+            .udp_encaps = true,
+        };
     }
 
     /// Send data on one SCTP stream.
@@ -245,19 +280,24 @@ pub const SctpSender = struct {
     /// Query the SCTP fragmentation point with SCTP_STATUS.
     /// usrsctp provides this value after connect.
     ///
-    /// Cap the result to a 1452-byte payload for an Ethernet-like path.
-    /// This avoids large loopback blocks. Return 1200 when the query is empty.
-    pub fn maxSegSize(self: *const SctpSender) u32 {
+    /// The result already has WavPack alignment and margin applied. The
+    /// fragmentation point is capped to an Ethernet-like payload for the
+    /// destination family and UDP encapsulation. Return 1200 on failure.
+    pub fn maxBlockBytes(self: *const SctpSender) u32 {
         const sock = self.sock orelse return 1200;
         var status = std.mem.zeroes(c.sctp_status);
         var len: c.socklen_t = @sizeOf(c.sctp_status);
         _ = c.usrsctp_getsockopt(sock, c.IPPROTO_SCTP, c.SCTP_STATUS, &status, &len);
-        const frag = status.sstat_fragmentation_point;
+        const frag: u32 = @intCast(status.sstat_fragmentation_point);
         if (frag == 0) return 1200;
-        // Cap the fragmentation point to an Ethernet-like payload.
-        const cap: u32 = 1500 - 48;
-        const effective = @min(@as(u32, @intCast(frag)), cap);
-        return (effective & ~@as(u32, 3)) -| 2;
+
+        var overhead: u32 = if (self.ipv6) 68 else 48;
+        if (self.udp_encaps) overhead += 8;
+        if (overhead >= 1500) return 1200;
+        const cap: u32 = 1500 - overhead;
+        const effective: u32 = @min(frag, cap);
+        if (effective < 2) return 1200;
+        return protocol.blockBytesForPayload(effective);
     }
 
     /// Wake a thread blocked in send without releasing the socket.
@@ -270,7 +310,7 @@ pub const SctpSender = struct {
         if (self.sock) |sock| {
             c.usrsctp_close(sock);
             self.sock = null;
-            deinitStack();
+            releaseStack(self.io);
         }
     }
 };
@@ -299,7 +339,7 @@ pub const SctpReceiver = struct {
     pub const Config = struct {
         /// Disable Nagle-style batching on accepted connections.
         nodelay: bool = true,
-        /// Reserved for backend parity. The current backend ignores this field.
+        /// SO_RCVBUF size in bytes. Zero selects the system default.
         rcvbuf_size: u32 = 0,
         /// Remote UDP encapsulation port. Zero leaves the peer port unset.
         udp_encaps_port: u16 = 0,
@@ -310,8 +350,8 @@ pub const SctpReceiver = struct {
     /// Call `accept()` to wait for a sender.
     /// The Io context must outlive the returned receiver.
     pub fn init(bind_addr: SocketAddr, num_streams: u16, cfg: Config, io: std.Io) !SctpReceiver {
-        try initStack(0, io);
-        errdefer deinitStack();
+        try acquireStack(0, io);
+        errdefer releaseStack(io);
 
         const sock = c.usrsctp_socket(
             @intCast(bind_addr.family()),
@@ -324,32 +364,17 @@ pub const SctpReceiver = struct {
         ) orelse return error.SocketFailed;
         errdefer c.usrsctp_close(sock);
 
-        var initmsg = std.mem.zeroes(c.sctp_initmsg);
-        initmsg.sinit_num_ostreams = num_streams;
-        initmsg.sinit_max_instreams = num_streams;
-        if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_INITMSG, &initmsg, @sizeOf(c.sctp_initmsg)) != 0)
-            return error.SetSockOptFailed;
+        try setInitMsg(sock, num_streams);
+
+        if (cfg.rcvbuf_size > 0) {
+            if (c.usrsctp_setsockopt(sock, c.SOL_SOCKET, c.SO_RCVBUF, &cfg.rcvbuf_size, @sizeOf(u32)) != 0)
+                return error.SetSockOptFailed;
+        }
 
         if (cfg.udp_encaps_port > 0) {
             // Configure the remote peer port for future associations. The
-            // local UDP port is process-wide and is selected by initStack().
-            var encaps = std.mem.zeroes(c.sctp_udpencaps);
-            const wildcard = switch (bind_addr.ip) {
-                .ip4 => SocketAddr.anyIp4(0),
-                .ip6 => SocketAddr.parseIp6(.{0} ** 16, 0, 0),
-            };
-            var enc_sa: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-            var enc_sa_len: posix.socklen_t = 0;
-            wildcard.toSockaddr(&enc_sa, &enc_sa_len);
-            const ss_size = @min(@sizeOf(posix.sockaddr.storage), @sizeOf(@TypeOf(encaps.sue_address)));
-            @memcpy(
-                @as([*]u8, @ptrCast(&encaps.sue_address))[0..ss_size],
-                @as([*]const u8, @ptrCast(&enc_sa))[0..ss_size],
-            );
-            encaps.sue_assoc_id = 0;
-            encaps.sue_port = std.mem.nativeToBig(u16, cfg.udp_encaps_port);
-            if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_REMOTE_UDP_ENCAPS_PORT, &encaps, @sizeOf(c.sctp_udpencaps)) != 0)
-                return error.SetSockOptFailed;
+            // local UDP port is process-wide and is selected by acquireStack().
+            try setUdpEncaps(sock, bind_addr.family(), cfg.udp_encaps_port);
         }
 
         const rcvinfo_on: c_int = 1;
@@ -387,18 +412,10 @@ pub const SctpReceiver = struct {
 
         const sock = conn orelse return false;
 
-        if (cfg.nodelay) {
-            const one: u32 = 1;
-            if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_NODELAY, &one, @sizeOf(@TypeOf(one))) != 0) {
-                c.usrsctp_close(sock);
-                return false;
-            }
-        }
-        const rcvinfo_on: c_int = 1;
-        if (c.usrsctp_setsockopt(sock, c.IPPROTO_SCTP, c.SCTP_RECVRCVINFO, &rcvinfo_on, @sizeOf(c_int)) != 0) {
+        configureAccepted(sock, cfg) catch {
             c.usrsctp_close(sock);
             return false;
-        }
+        };
 
         self.pending_sock = sock;
         self.pending_peer_addr = SocketAddr.fromSockaddr(&addr_buf, addrlen) catch null;
@@ -422,15 +439,16 @@ pub const SctpReceiver = struct {
         if (self.conn_sock) |s| _ = c.usrsctp_shutdown(s, 2); // SHUT_RDWR.
     }
 
-    /// Wake threads blocked in accept or recv without releasing sockets.
+    /// Wake threads blocked in recv without releasing sockets. usrsctp does
+    /// not reliably wake a thread blocked in accept.
     /// Call close() after the workers have exited.
     pub fn shutdown(self: *SctpReceiver) void {
         self.shutdownConn();
         if (self.listen_sock) |s| _ = c.usrsctp_shutdown(s, 2); // SHUT_RDWR.
     }
 
-    /// Wake threads blocked in accept or recv. Call close() after the workers
-    /// have exited to release the sockets.
+    /// Wake threads blocked in recv. usrsctp does not reliably wake a thread
+    /// blocked in accept. Call close() after the workers have exited.
     pub fn cancel(self: *SctpReceiver) void {
         self.shutdown();
     }
@@ -451,7 +469,8 @@ pub const SctpReceiver = struct {
     }
 
     /// Accept one incoming SCTP association.
-    /// Block until a sender connects.
+    /// Block until a sender connects. Association-specific options apply here;
+    /// listener address and UDP encapsulation are set by init().
     pub fn accept(self: *SctpReceiver, cfg: Config) !void {
         if (self.conn_sock != null or self.pending_sock != null) return error.InvalidState;
         const ls = self.listen_sock orelse return error.NotConnected;
@@ -461,15 +480,7 @@ pub const SctpReceiver = struct {
             return error.AcceptFailed;
         errdefer c.usrsctp_close(conn);
 
-        if (cfg.nodelay) {
-            const one: u32 = 1;
-            if (c.usrsctp_setsockopt(conn, c.IPPROTO_SCTP, c.SCTP_NODELAY, &one, @sizeOf(u32)) != 0)
-                return error.SetSockOptFailed;
-        }
-
-        const rcvinfo_on: c_int = 1;
-        if (c.usrsctp_setsockopt(conn, c.IPPROTO_SCTP, c.SCTP_RECVRCVINFO, &rcvinfo_on, @sizeOf(c_int)) != 0)
-            return error.SetSockOptFailed;
+        try configureAccepted(conn, cfg);
 
         self.conn_sock = conn;
         self.peer_addr = SocketAddr.fromSockaddr(&addr_buf, addrlen) catch null;
@@ -540,7 +551,7 @@ pub const SctpReceiver = struct {
             self.listen_sock = null;
         }
         if (self.stack_acquired) {
-            deinitStack();
+            releaseStack(self.io);
             self.stack_acquired = false;
         }
     }
@@ -555,15 +566,9 @@ pub const SctpReceiver = struct {
 /// Test Io context used by sleep and lock primitives.
 const test_io = std.testing.io;
 
-/// Sleep for a test interval with the test Io context.
-fn sleepMs(ms: i64) void {
-    std.Io.sleep(test_io, std.Io.Duration.fromMilliseconds(ms), .awake) catch |e|
-        std.log.warn("sleepMs sleep failed: {}", .{e});
-}
-
 test "acquireStack/releaseStack refcount" {
     // Start from a zero-reference state.
-    deinitStack();
+    releaseStack(test_io);
 
     // The first acquire initializes usrsctp and records the port.
     try acquireStack(9899, test_io);
@@ -580,22 +585,22 @@ test "acquireStack/releaseStack refcount" {
     try std.testing.expectEqual(g_stack_port, 9899);
 
     // Each release decrements the count. usrsctp_finish runs at zero.
-    releaseStack();
+    releaseStack(test_io);
     try std.testing.expectEqual(g_stack_refcount, 2);
-    releaseStack();
+    releaseStack(test_io);
     try std.testing.expectEqual(g_stack_refcount, 1);
-    releaseStack();
+    releaseStack(test_io);
     try std.testing.expectEqual(g_stack_refcount, 0);
 
-    // The stored port remains available for later state checks.
+    // A successful finish clears the initialized flag and the stored port.
 }
 
 test "acquireStack port mismatch error" {
-    deinitStack();
+    releaseStack(test_io);
 
     // Initialize the stack with port 9899.
     try acquireStack(9899, test_io);
-    defer releaseStack();
+    defer releaseStack(test_io);
 
     // A different port must be rejected without disturbing the stack.
     try std.testing.expectError(error.PortMismatch, acquireStack(9900, test_io));
@@ -608,15 +613,15 @@ test "acquireStack port mismatch error" {
     try std.testing.expectEqual(g_stack_refcount, 3);
 
     // Release the remaining references.
-    releaseStack();
-    releaseStack();
+    releaseStack(test_io);
+    releaseStack(test_io);
 }
 
 test "SctpReceiver cancel is safe to call without a peer" {
     // usrsctp accept() waits on an internal condition.
     // Closing the listen socket does not reliably wake that condition.
     // This test checks that cancel() clears the handle and close() is safe.
-    deinitStack();
+    releaseStack(test_io);
 
     var receiver = try SctpReceiver.init(
         SocketAddr.loopbackIp4(5099),

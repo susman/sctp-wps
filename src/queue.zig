@@ -39,7 +39,7 @@ pub const BlockHandoff = struct {
     /// True after consume() returns a block and before ack() is called.
     consumer_active: bool = false,
     /// True after shutdown begins.
-    done: bool = false,
+    done: std.atomic.Value(bool) = .init(false),
 
     /// Initialize an empty handoff.
     pub fn init(io: std.Io) BlockHandoff {
@@ -55,7 +55,7 @@ pub const BlockHandoff = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        if (self.done) return false;
+        if (self.done.load(.acquire)) return false;
 
         self.block_ptr = data.ptr;
         self.block_len = data.len;
@@ -66,13 +66,13 @@ pub const BlockHandoff = struct {
         while (self.has_block) {
             // A shutdown may abandon a block that no consumer has taken, but
             // it must not release the producer while a consumer owns it.
-            if (self.done and !self.consumer_active) {
+            if (self.done.load(.acquire) and !self.consumer_active) {
                 self.has_block = false;
                 break;
             }
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        if (self.done) return false;
+        if (self.done.load(.acquire)) return false;
         return self.send_ok;
     }
 
@@ -83,10 +83,10 @@ pub const BlockHandoff = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        while (!self.has_block and !self.done) {
+        while (!self.has_block and !self.done.load(.acquire)) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        if (self.done) return null;
+        if (self.done.load(.acquire)) return null;
 
         self.consumer_active = true;
         return self.block_ptr[0..self.block_len];
@@ -111,17 +111,62 @@ pub const BlockHandoff = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        self.done = true;
+        self.done.store(true, .release);
         self.cond.broadcast(self.io);
     }
 
     /// Return true after `signalDone()` has been called.
-    pub fn isDone(self: *BlockHandoff) bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.done;
+    pub fn isDone(self: *const BlockHandoff) bool {
+        return self.done.load(.acquire);
     }
 };
+
+/// Shared background-error latch for Writer and Reader.
+///
+/// A background thread records the first fatal error. The caller thread
+/// checks the latch later. `isSet()` is the lock-free fast path. All other
+/// methods use lockUncancelable because background threads must not lose
+/// an error to cancellation.
+pub const BgErr = struct {
+    /// First recorded error, or null. Guarded by `mutex`.
+    err: ?anyerror = null,
+    mutex: std.Io.Mutex = .init,
+    /// Fast-path flag. Stored with release before the first record() write.
+    set: std.atomic.Value(bool) = .init(false),
+
+    /// Store err when it is the first error. Return true when stored.
+    pub fn record(self: *BgErr, io: std.Io, err: anyerror) bool {
+        self.set.store(true, .release);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.err != null) return false;
+        self.err = err;
+        return true;
+    }
+
+    /// Return the recorded error, or null when none is recorded.
+    /// Keep the error. Use clear() to reset the latch.
+    pub fn check(self: *BgErr, io: std.Io) !void {
+        if (!self.set.load(.acquire)) return;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.err) |err| return err;
+    }
+
+    /// Drop the recorded error so a new session starts clean.
+    pub fn clear(self: *BgErr, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.err = null;
+        self.set.store(false, .release);
+    }
+
+    /// Lock-free fast path for hot callers.
+    pub fn isSet(self: *const BgErr) bool {
+        return self.set.load(.acquire);
+    }
+};
+
 /// Create a bounded blocking ring queue for values of type `T`.
 pub fn BoundedQueue(comptime T: type) type {
     return struct {
@@ -143,8 +188,8 @@ pub fn BoundedQueue(comptime T: type) type {
         closed: bool = false,
         /// Io context used by the queue.
         io: std.Io = std.Io.failing,
-        /// Allocator for ring storage.
-        allocator: std.mem.Allocator = std.heap.c_allocator,
+        /// Allocator for ring storage. Set by init().
+        allocator: std.mem.Allocator,
         /// Protects ring state.
         mutex: std.Io.Mutex = .init,
         not_empty: std.Io.Condition = .init, // Wakes pop and waitForDepth.

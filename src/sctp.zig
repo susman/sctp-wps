@@ -139,24 +139,24 @@ pub const SocketAddr = struct {
 
 /// Acquire a reference to the SCTP stack.
 /// On usrsctp, initialize the singleton on the first call and increment its
-/// reference count. The stack stays alive until matching releaseStack() calls.
+/// reference count. The stack stays alive until matching releaseStack(io) calls.
 /// On Linux, this function is a no-op.
 ///
 /// `io` backs the usrsctp stack mutex operations.
 pub fn acquireStack(local_port: u16, io: std.Io) !void {
-    if (@hasDecl(backend, "acquireStack")) try backend.acquireStack(local_port, io);
+    try backend.acquireStack(local_port, io);
 }
 
 /// Release one reference to the SCTP stack.
 /// On usrsctp, shut down the singleton when the count reaches zero.
 /// On Linux, this function is a no-op.
-pub fn releaseStack() void {
-    if (@hasDecl(backend, "releaseStack")) backend.releaseStack();
+pub fn releaseStack(io: std.Io) void {
+    backend.releaseStack(io);
 }
 
 /// Cancel a blocking sender connect when the selected backend supports it.
 pub fn cancelConnect(state: *ConnectState) void {
-    if (@hasDecl(backend, "cancelConnect")) backend.cancelConnect(state);
+    backend.cancelConnect(state);
 }
 
 test {
